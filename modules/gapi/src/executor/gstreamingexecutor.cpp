@@ -2,7 +2,7 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 //
-// Copyright (C) 2019-2020 Intel Corporation
+// Copyright (C) 2019-2021 Intel Corporation
 
 #include "precomp.hpp"
 
@@ -16,13 +16,22 @@
 #include <opencv2/gapi/core.hpp> // GCopy -- FIXME - to be removed!
 #endif // GAPI_STANDALONE
 
+#include "utils/itt.hpp"
+
 #include "api/gproto_priv.hpp" // ptr(GRunArgP)
 #include "compiler/passes/passes.hpp"
 #include "backends/common/gbackend.hpp" // createMat
 #include "backends/streaming/gstreamingbackend.hpp" // GCopy
 #include "compiler/gcompiler.hpp" // for compileIslands
 
+#include <logger.hpp>
+
 #include "executor/gstreamingexecutor.hpp"
+
+#include <opencv2/gapi/streaming/meta.hpp>
+#include <opencv2/gapi/streaming/sync.hpp>
+
+#include <opencv2/gapi/util/variant.hpp>
 
 namespace
 {
@@ -31,6 +40,10 @@ using namespace cv::gimpl::stream;
 #if !defined(GAPI_STANDALONE)
 class VideoEmitter final: public cv::gimpl::GIslandEmitter {
     cv::gapi::wip::IStreamSource::Ptr src;
+
+    virtual void halt() override {
+        src->halt();
+    }
 
     virtual bool pull(cv::GRunArg &arg) override {
         // FIXME: probably we can maintain a pool of (then) pre-allocated
@@ -52,6 +65,10 @@ public:
 
 class ConstEmitter final: public cv::gimpl::GIslandEmitter {
     cv::GRunArg m_arg;
+
+    virtual void halt() override {
+        // Not used here, but in fact can be used.
+    }
 
     virtual bool pull(cv::GRunArg &arg) override {
         arg = const_cast<const cv::GRunArg&>(m_arg); // FIXME: variant workaround
@@ -148,7 +165,7 @@ void sync_data(cv::GRunArgs &results, cv::GRunArgsP &outputs)
             *cv::util::get<cv::MediaFrame*>(out_obj) = std::move(cv::util::get<cv::MediaFrame>(res_obj));
             break;
         default:
-            GAPI_Assert(false && "This value type is not supported!"); // ...maybe because of STANDALONE mode.
+            GAPI_Error("This value type is not supported!"); // ...maybe because of STANDALONE mode.
             break;
         }
     }
@@ -181,8 +198,9 @@ void sync_data(cv::gimpl::stream::Result &r, cv::GOptRunArgsP &outputs)
         // FIXME: this conversion should be unified
         switch (out_obj.index())
         {
-            HANDLE_CASE(cv::Scalar); break;
-            HANDLE_CASE(cv::RMat);   break;
+            HANDLE_CASE(cv::Scalar);     break;
+            HANDLE_CASE(cv::RMat);       break;
+            HANDLE_CASE(cv::MediaFrame); break;
 
         case T::index_of<O<cv::Mat>*>(): {
             // Mat: special handling.
@@ -217,7 +235,7 @@ void sync_data(cv::gimpl::stream::Result &r, cv::GOptRunArgsP &outputs)
         } break;
         default:
             // ...maybe because of STANDALONE mode.
-            GAPI_Assert(false && "This value type is not supported!");
+            GAPI_Error("This value type is not supported!");
             break;
         }
     }
@@ -302,15 +320,53 @@ class QueueReader
                       const std::size_t  this_id);
 
 public:
-    bool getInputVector  (std::vector<Q*>   &in_queues,
-                          cv::GRunArgs      &in_constants,
-                          cv::GRunArgs      &isl_inputs);
+    cv::gimpl::StreamMsg getInputVector  (std::vector<Q*>   &in_queues,
+                                          cv::GRunArgs      &in_constants);
 
-    bool getResultsVector(std::vector<Q*>         &in_queues,
-                          const std::vector<int>  &in_mapping,
-                          const std::size_t        out_size,
-                          cv::GRunArgs            &out_results);
+    using V = cv::util::variant<cv::GRunArgs, Stop, cv::gimpl::Exception>;
+    V getResultsVector(std::vector<Q*>         &in_queues,
+                       const std::vector<int>  &in_mapping,
+                       const std::size_t        out_size);
 };
+
+void rewindToStop(std::vector<Q*> &in_queues,
+                  const std::size_t  this_id)
+{
+    size_t expected_stop_count = std::count_if(in_queues.begin(), in_queues.end(), [] (const Q* ptr) {
+        return ptr != nullptr;
+    });
+
+    if (expected_stop_count > 0) {
+        // NB: it requires to substract own queues id from total waiting queue count
+        // because it had got stop message before rewind was called
+        expected_stop_count--;
+    }
+    GAPI_LOG_DEBUG(nullptr, "id: " << this_id << ", queues count: " << in_queues.size() <<
+                            ", expected stop msg count: " << expected_stop_count);
+    size_t got_stop_count = 0;
+    while(got_stop_count < expected_stop_count) {
+        for (auto &&qit : ade::util::indexed(in_queues)) {
+            auto id2 = ade::util::index(qit);
+            auto &q2 = ade::util::value(qit);
+            if (this_id == id2) continue;
+
+            GAPI_LOG_DEBUG(nullptr, "drain next id: " << id2 <<
+                                    ", stop count (" << got_stop_count << "/" <<
+                                    expected_stop_count << ")");
+            bool got_cmd = true;
+            while (q2 && got_cmd) {
+                Cmd cmd;
+                got_cmd = q2->try_pop(cmd);
+                if (got_cmd && cv::util::holds_alternative<Stop>(cmd)) {
+                    got_stop_count ++;
+                    GAPI_LOG_DEBUG(nullptr, "got stop from id: " << id2);
+                    break;
+                }
+            }
+        }
+    }
+    GAPI_LOG_DEBUG(nullptr, "completed");
+}
 
 // This method handles a stop sign got from some input
 // island. Reiterate through all _remaining valid_ queues (some of
@@ -319,82 +375,92 @@ public:
 void QueueReader::rewindToStop(std::vector<Q*>   &in_queues,
                                const std::size_t  this_id)
 {
-    for (auto &&qit : ade::util::indexed(in_queues))
-    {
-        auto id2 = ade::util::index(qit);
-        auto &q2 = ade::util::value(qit);
-        if (this_id == id2) continue;
-
-        Cmd cmd;
-        while (q2 && !cv::util::holds_alternative<Stop>(cmd))
-            q2->pop(cmd);
-    }
+    ::rewindToStop(in_queues, this_id);
 }
 
-bool QueueReader::getInputVector(std::vector<Q*> &in_queues,
-                                 cv::GRunArgs    &in_constants,
-                                 cv::GRunArgs    &isl_inputs)
+cv::gimpl::StreamMsg QueueReader::getInputVector(std::vector<Q*> &in_queues,
+                                                 cv::GRunArgs    &in_constants)
 {
+    // NB: Need to release resources from the previous step, to fetch new ones.
+    // On some systems it might be impossible to allocate new memory
+    // until the old one is released.
+    m_cmd.clear();
     // NOTE: in order to maintain the GRunArg's underlying object
     // lifetime, keep the whole cmd vector (of size == # of inputs)
     // in memory.
     m_cmd.resize(in_queues.size());
-    isl_inputs.resize(in_queues.size());
+    cv::GRunArgs isl_inputs(in_queues.size());
 
+    cv::optional<cv::gimpl::Exception> exception;
     for (auto &&it : ade::util::indexed(in_queues))
     {
-        auto id = ade::util::index(it);
-        auto &q = ade::util::value(it);
+       auto id = ade::util::index(it);
+       auto &q = ade::util::value(it);
 
-        if (q == nullptr)
-        {
-            GAPI_Assert(!in_constants.empty());
-            // NULL queue means a graph-constant value (like a
-            // value-initialized scalar)
-            // It can also hold a constant value received with
-            // Stop::Kind::CNST message (see above).
-            isl_inputs[id] = in_constants[id];
-            continue;
-        }
+       if (q == nullptr)
+       {
+           GAPI_Assert(!in_constants.empty());
+           // NULL queue means a graph-constant value (like a
+           // value-initialized scalar)
+           // It can also hold a constant value received with
+           // Stop::Kind::CNST message (see above).
+           isl_inputs[id] = in_constants[id];
+           continue;
+       }
 
-        q->pop(m_cmd[id]);
-        if (!cv::util::holds_alternative<Stop>(m_cmd[id]))
-        {
-            isl_inputs[id] = cv::util::get<cv::GRunArg>(m_cmd[id]);
-        }
-        else // A Stop sign
-        {
-            const auto &stop = cv::util::get<Stop>(m_cmd[id]);
-            if (stop.kind == Stop::Kind::CNST)
-            {
-                // We've got a Stop signal from a const source,
-                // propagated as a result of real stream reaching its
-                // end.  Sometimes these signals come earlier than
-                // real EOS Stops so are deprioritized -- just
-                // remember the Const value here and continue
-                // processing other queues. Set queue pointer to
-                // nullptr and update the const_val vector
-                // appropriately
-                m_finishing = true;
-                in_queues[id] = nullptr;
-                in_constants.resize(in_queues.size());
-                in_constants[id] = std::move(stop.cdata);
+       q->pop(m_cmd[id]);
+       switch (m_cmd[id].index())
+       {
+           case Cmd::index_of<cv::GRunArg>():
+               isl_inputs[id] = cv::util::get<cv::GRunArg>(m_cmd[id]);
+               break;
+           case Cmd::index_of<Stop>():
+           {
+               const auto &stop = cv::util::get<Stop>(m_cmd[id]);
+               if (stop.kind == Stop::Kind::CNST)
+               {
+                   // We've got a Stop signal from a const source,
+                   // propagated as a result of real stream reaching its
+                   // end.  Sometimes these signals come earlier than
+                   // real EOS Stops so are deprioritized -- just
+                   // remember the Const value here and continue
+                   // processing other queues. Set queue pointer to
+                   // nullptr and update the const_val vector
+                   // appropriately
+                   m_finishing = true;
+                   in_queues[id] = nullptr;
+                   in_constants.resize(in_queues.size());
+                   in_constants[id] = std::move(stop.cdata);
 
-                // NEXT time (on a next call to getInputVector()), the
-                // "q==nullptr" check above will be triggered, but now
-                // we need to make it manually:
-                isl_inputs[id] = in_constants[id];
-            }
-            else
-            {
-                GAPI_Assert(stop.kind == Stop::Kind::HARD);
-                rewindToStop(in_queues, id);
-                // After queues are read to the proper indicator,
-                // indicate end-of-stream
-                return false;
-            } // if(Cnst)
-        } // if(Stop)
+                   // NEXT time (on a next call to getInputVector()), the
+                   // "q==nullptr" check above will be triggered, but now
+                   // we need to make it manually:
+                   isl_inputs[id] = in_constants[id];
+               }
+               else
+               {
+                   GAPI_Assert(stop.kind == Stop::Kind::HARD);
+                   rewindToStop(in_queues, id);
+                   // After queues are read to the proper indicator,
+                   // indicate end-of-stream
+                   return cv::gimpl::StreamMsg{cv::gimpl::EndOfStream{}};
+              } // if(Cnst)
+              break;
+          }
+          case Cmd::index_of<cv::gimpl::Exception>():
+          {
+              exception =
+                  cv::util::make_optional(cv::util::get<cv::gimpl::Exception>(m_cmd[id]));
+              break;
+          }
+          default:
+              GAPI_Error("Unsupported cmd type in getInputVector()");
+       }
     } // for(in_queues)
+
+    if (exception.has_value()) {
+        return cv::gimpl::StreamMsg{exception.value()};
+    }
 
     if (m_finishing)
     {
@@ -402,9 +468,19 @@ bool QueueReader::getInputVector(std::vector<Q*> &in_queues,
         // already) and an island has no other inputs than constant
         // inputs, its queues may all become nullptrs. Indicate it as
         // "no data".
-        return !ade::util::all_of(in_queues, [](Q *ptr){return ptr == nullptr;});
+        if (ade::util::all_of(in_queues, [](Q *ptr){return ptr == nullptr;})) {
+            return cv::gimpl::StreamMsg{cv::gimpl::EndOfStream{}};
+        }
     }
-    return true; // A regular case - there is data to process.
+    // A regular case - there is data to process
+    for (auto& arg : isl_inputs) {
+        if (arg.index() == cv::GRunArg::index_of<cv::Mat>()) {
+            arg = cv::GRunArg{ cv::make_rmat<cv::gimpl::RMatOnMat>(cv::util::get<cv::Mat>(arg))
+                             , arg.meta
+                             };
+        }
+    }
+    return cv::gimpl::StreamMsg{std::move(isl_inputs)};
 }
 
 // This is a special method to obtain a result vector
@@ -432,33 +508,47 @@ bool QueueReader::getInputVector(std::vector<Q*> &in_queues,
 // (_may be_ partially filled) to the same final output queue.
 // The receiver part at the GStreamingExecutor level won't change
 // because of that.
-bool QueueReader::getResultsVector(std::vector<Q*>   &in_queues,
-                                   const std::vector<int>  &in_mapping,
-                                   const std::size_t  out_size,
-                                   cv::GRunArgs      &out_results)
+
+QueueReader::V QueueReader::getResultsVector(std::vector<Q*>        &in_queues,
+                                             const std::vector<int> &in_mapping,
+                                             const std::size_t      out_size)
 {
+    cv::GRunArgs out_results(out_size);
     m_cmd.resize(out_size);
+    cv::optional<cv::gimpl::Exception> exception;
     for (auto &&it : ade::util::indexed(in_queues))
     {
         auto ii = ade::util::index(it);
         auto oi = in_mapping[ii];
         auto &q = ade::util::value(it);
         q->pop(m_cmd[oi]);
-        if (!cv::util::holds_alternative<Stop>(m_cmd[oi]))
-        {
-            out_results[oi] = std::move(cv::util::get<cv::GRunArg>(m_cmd[oi]));
-        }
-        else // A Stop sign
-        {
-            // In theory, the CNST should never reach here.
-            // Collector thread never handles the inputs directly
-            // (collector's input queues are always produced by
-            // islands in the graph).
-            rewindToStop(in_queues, ii);
-            return false;
-        } // if(Stop)
+
+        switch (m_cmd[oi].index()) {
+            case Cmd::index_of<cv::GRunArg>():
+                out_results[oi] = std::move(cv::util::get<cv::GRunArg>(m_cmd[oi]));
+                break;
+            case Cmd::index_of<Stop>():
+                // In theory, the CNST should never reach here.
+                // Collector thread never handles the inputs directly
+                // (collector's input queues are always produced by
+                // islands in the graph).
+                rewindToStop(in_queues, ii);
+                return QueueReader::V(Stop{});
+            case Cmd::index_of<cv::gimpl::Exception>():
+                exception =
+                    cv::util::make_optional(cv::util::get<cv::gimpl::Exception>(m_cmd[oi]));
+                break;
+            default:
+                cv::util::throw_error(
+                        std::logic_error("Unexpected cmd kind in getResultsVector"));
+        } // switch
     } // for(in_queues)
-    return true;
+
+    if (exception.has_value()) {
+        return QueueReader::V(exception.value());
+    }
+
+    return QueueReader::V(out_results);
 }
 
 
@@ -479,13 +569,21 @@ void emitterActorThread(std::shared_ptr<cv::gimpl::GIslandEmitter> emitter,
                 || cv::util::holds_alternative<Stop>(cmd));
     if (cv::util::holds_alternative<Stop>(cmd))
     {
-        for (auto &&oq : out_queues) oq->push(cmd);
+        for (auto &&oq : out_queues) {
+            oq->push(cmd);
+        }
         return;
     }
+
+    GAPI_ITT_STATIC_LOCAL_HANDLE(emitter_hndl, "emitter");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(emitter_pull_hndl, "emitter_pull");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(emitter_push_hndl, "emitter_push");
 
     // Now start emitting the data from the source to the pipeline.
     while (true)
     {
+        GAPI_ITT_AUTO_TRACE_GUARD(emitter_hndl);
+
         Cmd cancel;
         if (in_queue.try_pop(cancel))
         {
@@ -496,10 +594,28 @@ void emitterActorThread(std::shared_ptr<cv::gimpl::GIslandEmitter> emitter,
             return;
         }
 
-        // Try to obrain next data chunk from the source
+        // Try to obtain next data chunk from the source
         cv::GRunArg data;
-        if (emitter->pull(data))
+
+        bool result = false;
+        try {
+            result = [&](){
+                GAPI_ITT_AUTO_TRACE_GUARD(emitter_pull_hndl);
+                return emitter->pull(data);
+            }();
+        } catch (...) {
+           auto eptr = std::current_exception();
+           for (auto &&oq : out_queues)
+           {
+               oq->push(Cmd{cv::gimpl::Exception{eptr}});
+           }
+           // NB: Go to the next iteration.
+           continue;
+       }
+
+        if (result)
         {
+            GAPI_ITT_AUTO_TRACE_GUARD(emitter_push_hndl);
             // // On success, broadcast it to our readers
             for (auto &&oq : out_queues)
             {
@@ -521,30 +637,105 @@ void emitterActorThread(std::shared_ptr<cv::gimpl::GIslandEmitter> emitter,
     }
 }
 
+// This thread pulls data from the assigned input queues and makes sure that
+// all input args are in sync (timestamps are equal), dropping some inputs if required.
+// After getting synchronized inputs from all input queues, the thread pushes them to out queues
+void syncActorThread(std::vector<Q*> in_queues,
+                     std::vector<std::vector<Q*>> out_queues) {
+    using timestamp_t = int64_t;
+    std::vector<bool> pop_nexts(in_queues.size());
+    std::vector<Cmd> cmds(in_queues.size());
+
+    GAPI_ITT_STATIC_LOCAL_HANDLE(sync_hndl, "sync_actor");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(sync_pull_1_queue_hndl, "sync_actor_pull_from_1_queue");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(sync_push_hndl, "sync_actor_push");
+    while (true) {
+        GAPI_ITT_AUTO_TRACE_GUARD(sync_hndl);
+        // pop_nexts indicates which queue still contains earlier timestamps and
+        // needs to be popped at least one more time.
+        // For each iteration (frame) we need to pull from each input queue at least once,
+        // so switch all to true when start processing new frame
+        for (auto&& p : pop_nexts) {
+            p = true;
+        }
+        timestamp_t max_ts = 0u;
+        // Iterate through all input queues, pop GRunArg's and compare timestamps.
+        // Continue pulling from queues whose timestamps are smaller.
+        // Finish when all timestamps are equal.
+        do {
+            for (auto&& it : ade::util::indexed(
+                                 ade::util::zip(pop_nexts, in_queues, cmds))) {
+                auto& val = ade::util::value(it);
+                auto& pop_next = std::get<0>(val);
+                if (!pop_next) {
+                    continue;
+                }
+                auto& q   = std::get<1>(val);
+                auto& cmd = std::get<2>(val);
+
+                {
+                    GAPI_ITT_AUTO_TRACE_GUARD(sync_pull_1_queue_hndl);
+                    q->pop(cmd);
+                }
+                if (cv::util::holds_alternative<Stop>(cmd)) {
+                    // We got a stop command from one of the input queues.
+                    // Rewind all input queues till Stop command,
+                    // Push Stop command down the graph, finish the thread
+                    rewindToStop(in_queues, ade::util::index(it));
+                    for (auto &&oqs : out_queues) {
+                        for (auto &&oq : oqs) {
+                            oq->push(Cmd{Stop{}});
+                        }
+                    }
+                    return;
+                }
+
+                // Extract the timestamp
+                auto& arg = cv::util::get<cv::GRunArg>(cmd);
+                auto ts = cv::util::any_cast<int64_t>(arg.meta[cv::gapi::streaming::meta_tag::timestamp]);
+                GAPI_Assert(ts >= 0u);
+
+                // TODO: this whole drop logic can be imported via compile args
+                // to give a user a way to customize it
+                if (ts < max_ts) {
+                    // Continue popping from this queue
+                    pop_next = true;
+                } else if (ts == max_ts) {
+                    // Stop popping from this queue
+                    pop_next = false;
+                } else if (ts > max_ts) {
+                    // We got a timestamp which is greater than timestamps from other queues.
+                    // It means that we need to reiterate through all the queues one more time
+                    // (except the current one)
+                    max_ts = ts;
+                    for (auto&& p : pop_nexts) {
+                        p = true;
+                    }
+                    pop_next = false;
+                }
+            }
+        } while (ade::util::any_of(pop_nexts, [](bool v){ return v; }));
+
+        // Finally we got all our inputs synchronized, push them further down the graph
+        {
+            GAPI_ITT_AUTO_TRACE_GUARD(sync_push_hndl);
+            for (auto &&it : ade::util::zip(out_queues, cmds)) {
+                for (auto &&q : std::get<0>(it)) {
+                    q->push(std::get<1>(it));
+                }
+            }
+        }
+    }
+}
+
 class StreamingInput final: public cv::gimpl::GIslandExecutable::IInput
 {
     QueueReader &qr;
     std::vector<Q*> &in_queues; // FIXME: This can be part of QueueReader
     cv::GRunArgs &in_constants; // FIXME: This can be part of QueueReader
 
-    virtual cv::gimpl::StreamMsg get() override
-    {
-        cv::GRunArgs isl_input_args;
-        if (!qr.getInputVector(in_queues, in_constants, isl_input_args))
-        {
-            // Stop case
-            return cv::gimpl::StreamMsg{cv::gimpl::EndOfStream{}};
-        }
-        // Wrap all input cv::Mats with RMats
-        for (auto& arg : isl_input_args) {
-            if (arg.index() == cv::GRunArg::index_of<cv::Mat>()) {
-                arg = cv::GRunArg{ cv::make_rmat<cv::gimpl::RMatAdapter>(cv::util::get<cv::Mat>(arg))
-                                 , arg.meta
-                                 };
-            }
-        }
-        return cv::gimpl::StreamMsg{std::move(isl_input_args)};
-    }
+    cv::optional<cv::gimpl::StreamMsg> last_read_msg;
+
     virtual cv::gimpl::StreamMsg try_get() override
     {
         // FIXME: This is not very usable at the moment!
@@ -559,17 +750,43 @@ class StreamingInput final: public cv::gimpl::GIslandExecutable::IInput
     {
         set(in_descs);
     }
+
+    const cv::gimpl::StreamMsg& read()
+    {
+        GAPI_ITT_STATIC_LOCAL_HANDLE(inputs_get_hndl, "StreamingInput::read");
+        GAPI_ITT_AUTO_TRACE_GUARD(inputs_get_hndl);
+
+        last_read_msg =
+            cv::optional<cv::gimpl::StreamMsg>(
+                    qr.getInputVector(in_queues, in_constants));
+        return last_read_msg.value();
+    }
+
+    virtual cv::gimpl::StreamMsg get() override
+    {
+        GAPI_ITT_STATIC_LOCAL_HANDLE(inputs_get_hndl, "StreamingInput::get");
+        GAPI_ITT_AUTO_TRACE_GUARD(inputs_get_hndl);
+
+        if (!last_read_msg.has_value()) {
+            (void)read();
+        }
+        auto msg = std::move(last_read_msg.value());
+        last_read_msg = cv::optional<cv::gimpl::StreamMsg>();
+        return msg;
+    }
 };
 
 class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
 {
     // These objects form an internal state of the StreamingOutput
     struct Posting
-    {
-        using V = cv::util::variant<cv::GRunArg, cv::gimpl::EndOfStream>;
-        V data;
-        bool ready = false;
-    };
+   {
+       using V = cv::util::variant<cv::GRunArg,
+                                   cv::gimpl::EndOfStream,
+                                   cv::gimpl::Exception>;
+       V data;
+       bool ready = false;
+   };
     using PostingList = std::list<Posting>;
     std::vector<PostingList> m_postings;
     std::unordered_map< const void*
@@ -590,6 +807,9 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
     // Prepare this object for posting
     virtual cv::GRunArgP get(int idx) override
     {
+        GAPI_ITT_STATIC_LOCAL_HANDLE(outputs_get_hndl, "StreamingOutput::get (alloc)");
+        GAPI_ITT_AUTO_TRACE_GUARD(outputs_get_hndl);
+
         std::lock_guard<std::mutex> lock{m_mutex};
 
         using MatType = cv::Mat;
@@ -618,7 +838,7 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
                 {
                     MatType newMat;
                     cv::gimpl::createMat(desc, newMat);
-                    auto rmat = cv::make_rmat<cv::gimpl::RMatAdapter>(newMat);
+                    auto rmat = cv::make_rmat<cv::gimpl::RMatOnMat>(newMat);
                     out_arg = cv::GRunArg(std::move(rmat));
                 }
                 ret_val = cv::GRunArgP(&cv::util::get<cv::RMat>(out_arg));
@@ -666,8 +886,12 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
         m_postIdx[cv::gimpl::proto::ptr(ret_val)] = std::make_pair(idx, iter);
         return ret_val;
     }
-    virtual void post(cv::GRunArgP&& argp) override
+
+    virtual void post(cv::GRunArgP&& argp, const std::exception_ptr& exptr) override
     {
+        GAPI_ITT_STATIC_LOCAL_HANDLE(outputs_post_hndl, "StreamingOutput::post");
+        GAPI_ITT_AUTO_TRACE_GUARD(outputs_post_hndl);
+
         std::lock_guard<std::mutex> lock{m_mutex};
 
         // Mark the output ready for posting. If it is the first in the line,
@@ -677,6 +901,9 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
         const int out_idx = it->second.first;
         const auto out_iter = it->second.second;
         out_iter->ready = true;
+        if (exptr) {
+            out_iter->data = cv::gimpl::Exception{exptr};
+        }
         m_postIdx.erase(it); // Drop the link from the cache anyway
         if (out_iter != m_postings[out_idx].begin())
         {
@@ -688,16 +915,22 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
         while (post_iter != m_postings[out_idx].end() && post_iter->ready == true)
         {
             Cmd cmd;
-            if (cv::util::holds_alternative<cv::GRunArg>(post_iter->data))
+            switch (post_iter->data.index())
             {
-                cmd = Cmd{cv::util::get<cv::GRunArg>(post_iter->data)};
+                case Posting::V::index_of<cv::GRunArg>():
+                    cmd = Cmd{cv::util::get<cv::GRunArg>(post_iter->data)};
+                    break;
+                case Posting::V::index_of<cv::gimpl::Exception>():
+                    cmd = Cmd{cv::util::get<cv::gimpl::Exception>(post_iter->data)};
+                    break;
+                case Posting::V::index_of<cv::gimpl::EndOfStream>():
+                    cmd = Cmd{Stop{}};
+                    m_stops_sent++;
+                    break;
+                default:
+                    GAPI_Error("Unreachable code");
             }
-            else
-            {
-                GAPI_Assert(cv::util::holds_alternative<cv::gimpl::EndOfStream>(post_iter->data));
-                cmd = Cmd{Stop{}};
-                m_stops_sent++;
-            }
+
             for (auto &&q : m_out_queues[out_idx])
             {
                 q->push(cmd);
@@ -705,6 +938,7 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
             post_iter = m_postings[out_idx].erase(post_iter);
         }
     }
+
     virtual void post(cv::gimpl::EndOfStream&&) override
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -731,6 +965,7 @@ class StreamingOutput final: public cv::gimpl::GIslandExecutable::IOutput
             }
         }
     }
+
     void meta(const cv::GRunArgP &out, const cv::GRunArg::Meta &m) override
     {
         std::lock_guard<std::mutex> lock{m_mutex};
@@ -761,6 +996,32 @@ public:
         // when it posted/resent all STOP messages to all its outputs.
         return m_stops_sent == desc().size();
     }
+
+    virtual void post(cv::gimpl::Exception&& error) override
+    {
+        std::lock_guard<std::mutex> lock{m_mutex};
+        // If the posting list is empty, just broadcast the stop message.
+        // If it is not, enqueue the Stop message in the postings list.
+        for (auto &&it : ade::util::indexed(m_postings))
+        {
+            const auto  idx = ade::util::index(it);
+                  auto &lst = ade::util::value(it);
+            if (lst.empty())
+            {
+                for (auto &&q : m_out_queues[idx])
+                {
+                    q->push(Cmd(std::move(error)));
+                }
+            }
+            else
+            {
+                Posting p;
+                p.data = Posting::V{std::move(error)};
+                p.ready = true;
+                lst.push_back(std::move(p)); // FIXME: For some reason {}-ctor didn't work here
+            }
+        }
+    }
 };
 
 // This thread is a plain dumb processing actor. What it do is just:
@@ -769,23 +1030,37 @@ public:
 //   executable for processing.
 // - Pushes processing results down to consumers - to the subsequent queues.
 //   Note: Every data object consumer has its own queue.
-void islandActorThread(std::vector<cv::gimpl::RcDesc> in_rcs,                // FIXME: this is...
-                       std::vector<cv::gimpl::RcDesc> out_rcs,               // FIXME: ...basically just...
-                       cv::GMetaArgs out_metas,                              // ...
-                       std::shared_ptr<cv::gimpl::GIslandExecutable> island, // FIXME: ...a copy of OpDesc{}.
+void islandActorThread(std::vector<cv::gimpl::RcDesc> in_rcs,                     // FIXME: this is...
+                       std::vector<cv::gimpl::RcDesc> out_rcs,                    // FIXME: ...basically just...
+                       cv::GMetaArgs out_metas,                                   // ...
+                       std::shared_ptr<cv::gimpl::GIslandExecutable> island_exec, // FIXME: ...a copy of OpDesc{}.
                        std::vector<Q*> in_queues,
                        cv::GRunArgs in_constants,
-                       std::vector< std::vector<Q*> > out_queues)
+                       std::vector< std::vector<Q*> > out_queues,
+                       const std::string& island_meta_info)
 {
     GAPI_Assert(in_queues.size() == in_rcs.size());
     GAPI_Assert(out_queues.size() == out_rcs.size());
     GAPI_Assert(out_queues.size() == out_metas.size());
     QueueReader qr;
     StreamingInput input(qr, in_queues, in_constants, in_rcs);
-    StreamingOutput output(out_metas, out_queues, out_rcs, island);
+    StreamingOutput output(out_metas, out_queues, out_rcs, island_exec);
+
+    GAPI_ITT_DYNAMIC_LOCAL_HANDLE(island_hndl, island_meta_info.c_str());
     while (!output.done())
     {
-        island->run(input, output);
+        GAPI_ITT_AUTO_TRACE_GUARD(island_hndl);
+        // NB: In case the input message is an cv::gimpl::Exception
+        // handle it in a general way.
+        if (cv::util::holds_alternative<cv::gimpl::Exception>(input.read()))
+        {
+            auto in_msg = input.get();
+            output.post(std::move(cv::util::get<cv::gimpl::Exception>(in_msg)));
+        }
+        else
+        {
+            island_exec->run(input, output);
+        }
     }
 }
 
@@ -814,21 +1089,42 @@ void collectorThread(std::vector<Q*>   in_queues,
         flags[idx] = true;
     }
 
+    GAPI_ITT_STATIC_LOCAL_HANDLE(collector_hndl, "collector");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(collector_get_results_hndl, "collector_get_results");
+    GAPI_ITT_STATIC_LOCAL_HANDLE(collector_push_hndl, "collector_push");
+
     QueueReader qr;
     while (true)
     {
-        cv::GRunArgs this_result(out_size);
-        const bool ok = qr.getResultsVector(in_queues, in_mapping, out_size, this_result);
-        if (!ok)
+        GAPI_ITT_AUTO_TRACE_GUARD(collector_hndl);
+
+        const auto result = [&](){
+            GAPI_ITT_AUTO_TRACE_GUARD(collector_get_results_hndl);
+            return qr.getResultsVector(in_queues, in_mapping, out_size);
+        }();
+
+        switch (result.index())
         {
-            if (handle_stop)
+            case QueueReader::V::index_of<cv::GRunArgs>():
             {
-                out_queue.push(Cmd{Stop{}});
+                GAPI_ITT_AUTO_TRACE_GUARD(collector_push_hndl);
+                auto this_result = cv::util::get<cv::GRunArgs>(result);
+                out_queue.push(Cmd{Result{std::move(this_result), flags}});
+                break;
             }
-            // Terminate the thread anyway
-            return;
+            case QueueReader::V::index_of<Stop>():
+                if (handle_stop)
+                {
+                    out_queue.push(Cmd{Stop{}});
+                }
+                // Terminate the thread anyway
+                return;
+            case QueueReader::V::index_of<cv::gimpl::Exception>():
+                out_queue.push(Cmd{cv::util::get<cv::gimpl::Exception>(result)});
+                break;
+            default:
+                GAPI_Error("Unreachable code");
         }
-        out_queue.push(Cmd{Result{std::move(this_result), flags}});
     }
 }
 
@@ -872,19 +1168,135 @@ void check_DesyncObjectConsumedByMultipleIslands(const cv::gimpl::GIslandModel::
     } // for(nodes)
 }
 
+// NB: Construct GRunArgsP based on passed info and store the memory in passed cv::GRunArgs.
+// Needed for python bridge, because in case python user doesn't pass output arguments to apply.
+void constructOptGraphOutputs(const cv::GTypesInfo &out_info,
+                                    cv::GOptRunArgs &args,
+                                    cv::GOptRunArgsP &outs)
+{
+    for (auto&& info : out_info)
+    {
+        switch (info.shape)
+        {
+            case cv::GShape::GMAT:
+            {
+                args.emplace_back(cv::optional<cv::Mat>{});
+                outs.emplace_back(&cv::util::get<cv::optional<cv::Mat>>(args.back()));
+                break;
+            }
+            case cv::GShape::GSCALAR:
+            {
+                args.emplace_back(cv::optional<cv::Scalar>{});
+                outs.emplace_back(&cv::util::get<cv::optional<cv::Scalar>>(args.back()));
+                break;
+            }
+            case cv::GShape::GARRAY:
+            {
+                cv::detail::VectorRef ref;
+                cv::util::get<cv::detail::ConstructVec>(info.ctor)(ref);
+                args.emplace_back(cv::util::make_optional(std::move(ref)));
+                outs.emplace_back(wrap_opt_arg(cv::util::get<cv::optional<cv::detail::VectorRef>>(args.back())));
+                break;
+            }
+            case cv::GShape::GOPAQUE:
+            {
+                cv::detail::OpaqueRef ref;
+                cv::util::get<cv::detail::ConstructOpaque>(info.ctor)(ref);
+                args.emplace_back(cv::util::make_optional(std::move(ref)));
+                outs.emplace_back(wrap_opt_arg(cv::util::get<cv::optional<cv::detail::OpaqueRef>>(args.back())));
+                break;
+            }
+            default:
+                cv::util::throw_error(std::logic_error("Unsupported optional output shape for Python"));
+        }
+    }
+}
 } // anonymous namespace
+
+class cv::gimpl::GStreamingExecutor::Synchronizer final {
+    gapi::streaming::sync_policy m_sync_policy = gapi::streaming::sync_policy::dont_sync;
+    ade::Graph& m_island_graph;
+    cv::gimpl::GIslandModel::Graph m_gim;
+    std::size_t m_queue_capacity = 0u;
+    std::thread m_thread;
+
+    std::vector<ade::NodeHandle> m_synchronized_emitters;
+    std::vector<stream::SyncQueue> m_sync_queues;
+
+    std::vector<stream::Q*> newSyncQueue() {
+        m_sync_queues.emplace_back(SyncQueue{});
+        m_sync_queues.back().set_capacity(m_queue_capacity);
+        return std::vector<Q*>{&m_sync_queues.back()};
+    }
+public:
+    Synchronizer(gapi::streaming::sync_policy sync_policy,
+                 ade::Graph& island_graph,
+                 std::size_t queue_capacity)
+        : m_sync_policy(sync_policy)
+        , m_island_graph(island_graph)
+        , m_gim(m_island_graph)
+        , m_queue_capacity(queue_capacity) {
+    }
+
+    void registerVideoEmitters(std::vector<ade::NodeHandle>&& emitters) {
+        // There is no point to make synchronization for the one video input
+        // so do nothing in this case
+        if (   m_sync_policy == cv::gapi::streaming::sync_policy::drop
+            && emitters.size() > 1u) {
+            m_synchronized_emitters = std::move(emitters);
+            m_sync_queues.reserve(m_synchronized_emitters.size());
+        }
+    }
+
+    std::vector<stream::Q*> outQueues(const ade::NodeHandle& emitter) {
+        // If the emitter was registered previously (which means it needs to be synchronized),
+        // create a new queue for this emitter to push the data to. Sync thread will
+        // pop from this queue and push data to emitter's readers.
+        // If the emitter was not registered, direct emitter output to its immediate readers right away
+        return m_synchronized_emitters.end() != std::find(m_synchronized_emitters.begin(),
+                                                          m_synchronized_emitters.end(),
+                                                          emitter)
+               ? newSyncQueue()
+               : reader_queues(m_island_graph, emitter->outNodes().front());
+    }
+
+    // Start a thread which will handle the synchronization.
+    // Do nothing if synchronization is not needed
+    void start() {
+        if (m_synchronized_emitters.size() != 0) {
+            GAPI_Assert(m_synchronized_emitters.size() > 1u);
+            std::vector<Q*> sync_in_queues(m_synchronized_emitters.size());
+            std::vector<std::vector<Q*>> sync_out_queues(m_synchronized_emitters.size());
+            for (auto it : ade::util::indexed(m_synchronized_emitters)) {
+                const auto id = ade::util::index(it);
+                const auto eh = ade::util::value(it);
+                sync_in_queues[id] = &m_sync_queues[id];
+                sync_out_queues[id] = reader_queues(m_island_graph, eh->outNodes().front());
+            }
+            m_thread = std::thread(syncActorThread,
+                                   std::move(sync_in_queues),
+                                   std::move(sync_out_queues));
+        }
+    }
+
+    void join() {
+        if (m_synchronized_emitters.size() != 0) {
+            m_thread.join();
+        }
+    }
+
+    void clear() {
+        for (auto &q : m_sync_queues) q.clear();
+        m_sync_queues.clear();
+        m_synchronized_emitters.clear();
+    }
+};
 
 // GStreamingExecutor expects compile arguments as input to have possibility to do
 // proper graph reshape and islands recompilation
 cv::gimpl::GStreamingExecutor::GStreamingExecutor(std::unique_ptr<ade::Graph> &&g_model,
                                                   const GCompileArgs &comp_args)
-    : m_orig_graph(std::move(g_model))
-    , m_island_graph(GModel::Graph(*m_orig_graph).metadata()
-                     .get<IslandModel>().model)
-    , m_comp_args(comp_args)
-    , m_gim(*m_island_graph)
-    , m_desync(GModel::Graph(*m_orig_graph).metadata()
-               .contains<Desynchronized>())
+    : GAbstractStreamingExecutor(std::move(g_model), comp_args)
 {
     GModel::Graph gm(*m_orig_graph);
     // NB: Right now GIslandModel is acyclic, and all the below code assumes that.
@@ -902,14 +1314,21 @@ cv::gimpl::GStreamingExecutor::GStreamingExecutor(std::unique_ptr<ade::Graph> &&
     m_sink_queues   .resize(proto.out_nhs.size(), nullptr);
     m_sink_sync     .resize(proto.out_nhs.size(), -1);
 
-    // Very rough estimation to limit internal queue sizes.
+    // Very rough estimation to limit internal queue sizes if not specified by the user.
     // Pipeline depth is equal to number of its (pipeline) steps.
-    const auto queue_capacity = 3*std::count_if
-        (m_gim.nodes().begin(),
-         m_gim.nodes().end(),
-         [&](ade::NodeHandle nh) {
-            return m_gim.metadata(nh).get<NodeKind>().k == NodeKind::ISLAND;
-         });
+    auto has_queue_capacity = cv::gapi::getCompileArg<cv::gapi::streaming::queue_capacity>(m_comp_args);
+    const auto queue_capacity = has_queue_capacity ? has_queue_capacity->capacity :
+            3*std::count_if
+            (m_gim.nodes().begin(),
+            m_gim.nodes().end(),
+            [&](ade::NodeHandle nh) {
+                return m_gim.metadata(nh).get<NodeKind>().k == NodeKind::ISLAND;
+            });
+    GAPI_Assert(queue_capacity != 0u);
+
+    auto sync_policy = cv::gimpl::getCompileArg<cv::gapi::streaming::sync_policy>(m_comp_args)
+                       .value_or(cv::gapi::streaming::sync_policy::dont_sync);
+    m_sync.reset(new Synchronizer(sync_policy, *m_island_graph, queue_capacity));
 
     // If metadata was not passed to compileStreaming, Islands are not compiled at this point.
     // It is fine -- Islands are then compiled in setSource (at the first valid call).
@@ -934,7 +1353,7 @@ cv::gimpl::GStreamingExecutor::GStreamingExecutor(std::unique_ptr<ade::Graph> &&
                 std::unordered_set<ade::NodeHandle, ade::HandleHasher<ade::Node> > const_ins;
 
                 // FIXME: THIS ORDER IS IRRELEVANT TO PROTOCOL OR ANY OTHER ORDER!
-                // FIXME: SAME APPLIES TO THE REGULAR GEEXECUTOR!!
+                // FIXME: SAME APPLIES TO THE REGULAR GEXECUTOR!!
                 auto xtract_in = [&](ade::NodeHandle slot_nh, std::vector<RcDesc> &vec)
                 {
                     const auto orig_data_nh
@@ -1068,7 +1487,7 @@ cv::gimpl::GStreamingExecutor::GStreamingExecutor(std::unique_ptr<ade::Graph> &&
             }
             break;
         default:
-            GAPI_Assert(false);
+            GAPI_Error("InternalError");
             break;
         } // switch(kind)
     } // for(gim nodes)
@@ -1089,30 +1508,35 @@ cv::gimpl::GStreamingExecutor::GStreamingExecutor(std::unique_ptr<ade::Graph> &&
     // per the same input frame, so the output traffic multiplies)
     GAPI_Assert(m_collector_map.size() > 0u);
     m_out_queue.set_capacity(queue_capacity * m_collector_map.size());
+
+    // FIXME: The code duplicates logic of collectGraphInfo()
+    cv::gimpl::GModel::ConstGraph cgr(*m_orig_graph);
+    auto meta = cgr.metadata().get<cv::gimpl::Protocol>().out_nhs;
+    out_info.reserve(meta.size());
+
+    ade::util::transform(meta, std::back_inserter(out_info), [&cgr](const ade::NodeHandle& nh) {
+        const auto& data = cgr.metadata(nh).get<cv::gimpl::Data>();
+        return cv::GTypeInfo{data.shape, data.kind, data.ctor};
+    });
 }
 
 cv::gimpl::GStreamingExecutor::~GStreamingExecutor()
 {
-    if (state == State::READY || state == State::RUNNING)
-        stop();
+    // FIXME: this is a temporary try-catch exception handling.
+    // Need to eliminate throwings from stop()
+    try {
+        if (state == State::READY || state == State::RUNNING)
+            stop();
+    } catch (const std::exception& e) {
+        std::stringstream message;
+        message << "~GStreamingExecutor() threw exception with message '" << e.what() << "'\n";
+        GAPI_LOG_WARNING(NULL, message.str());
+    }
 }
 
 void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
 {
     GAPI_Assert(state == State::READY || state == State::STOPPED);
-
-    const auto is_video = [](const GRunArg &arg)
-    {
-        return util::holds_alternative<cv::gapi::wip::IStreamSource::Ptr>(arg);
-    };
-    const auto num_videos = std::count_if(ins.begin(), ins.end(), is_video);
-    if (num_videos > 1)
-    {
-        // See below why (another reason - no documented behavior
-        // on handling videos streams of different length)
-        util::throw_error(std::logic_error("Only one video source is"
-                                           " currently supported!"));
-    }
 
     GModel::ConstGraph gm(*m_orig_graph);
     // Now the tricky-part: completing Islands compilation if compileStreaming
@@ -1142,7 +1566,7 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
             }
         }
     };
-    bool islandsRecompiled = false;
+
     const auto new_meta = cv::descr_of(ins); // 0
     if (gm.metadata().contains<OriginalInputMeta>()) // (1)
     {
@@ -1164,8 +1588,6 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
             }
             update_int_metas(); // (7)
             m_reshapable = util::make_optional(is_reshapable);
-
-            islandsRecompiled = true;
         }
         else // (8)
         {
@@ -1180,6 +1602,8 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
 
     // Walk through the protocol, set-up emitters appropriately
     // There's a 1:1 mapping between emitters and corresponding data inputs.
+    // Also collect video emitter nodes to use them later in synchronization
+    std::vector<ade::NodeHandle> video_emitters;
     for (auto it : ade::util::zip(ade::util::toRange(m_emitters),
                                   ade::util::toRange(ins),
                                   ade::util::iota(m_emitters.size())))
@@ -1197,6 +1621,9 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
         case T::index_of<cv::gapi::wip::IStreamSource::Ptr>():
 #if !defined(GAPI_STANDALONE)
             emitter.reset(new VideoEmitter{emit_arg});
+            // Currently all video inputs are synchronized if sync policy is to drop,
+            // there is no different fps branches etc, so all video emitters are registered
+            video_emitters.emplace_back(emit_nh);
 #else
             util::throw_error(std::logic_error("Video is not supported in the "
                                                "standalone mode"));
@@ -1212,11 +1639,10 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
         }
     }
 
-    // FIXME: The below code assumes our graph may have only one
-    // real video source (and so, only one stream which may really end)
-    // all other inputs are "constant" generators.
+    m_sync->registerVideoEmitters(std::move(video_emitters));
+
     // Craft here a completion callback to notify Const emitters that
-    // a video source is over
+    // any of video sources is over
     GAPI_Assert(m_const_emitter_queues.size() == m_const_vals.size());
     auto real_video_completion_cb = [this]()
     {
@@ -1249,7 +1675,7 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
         auto emitter = m_gim.metadata(eh).get<Emitter>().object;
 
         // Collect all reader queues from the emitter's the only output object
-        auto out_queues = reader_queues(*m_island_graph, eh->outNodes().front());
+        auto out_queues = m_sync->outQueues(eh);
 
         m_threads.emplace_back(emitterActorThread,
                                emitter,
@@ -1258,11 +1684,13 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
                                real_video_completion_cb);
     }
 
+    m_sync->start();
+
     // Now do this for every island (in a topological order)
     for (auto &&op : m_ops)
     {
         // Prepare island thread parameters
-        auto island = m_gim.metadata(op.nh).get<IslandExec>().object;
+        auto island_exec = m_gim.metadata(op.nh).get<IslandExec>().object;
 
         // Collect actor's input queues
         auto in_queues = input_queues(*m_island_graph, op.nh);
@@ -1274,23 +1702,25 @@ void cv::gimpl::GStreamingExecutor::setSource(GRunArgs &&ins)
             out_queues.push_back(reader_queues(*m_island_graph, out_eh));
         }
 
-        // If Island Executable is recompiled, all its stuff including internal kernel states
-        // are recreated and re-initialized automatically.
-        // But if not, we should notify Island Executable about new started stream to let it update
-        // its internal variables.
-        if (!islandsRecompiled)
-        {
-            op.isl_exec->handleNewStream();
-        }
+        // Create just empty island meta information
+        std::string island_meta_info { };
+#if defined(OPENCV_WITH_ITT)
+        // In case if ITT tracing is enabled fill meta information with the built island name
+        island_meta_info = GIslandModel::traceIslandName(op.nh, m_gim);
+#endif // OPENCV_WITH_ITT
+
+        // Notify island executable about a new stream to let it update its internal variables.
+        op.isl_exec->handleNewStream();
 
         m_threads.emplace_back(islandActorThread,
                                op.in_objects,
                                op.out_objects,
                                op.out_metas,
-                               island,
+                               island_exec,
                                in_queues,
                                op.in_constants,
-                               out_queues);
+                               out_queues,
+                               island_meta_info);
     }
 
     // Finally, start collector thread(s).
@@ -1341,6 +1771,7 @@ void cv::gimpl::GStreamingExecutor::wait_shutdown()
     // FIXME: Of course it can be designed much better
     for (auto &t : m_threads) t.join();
     m_threads.clear();
+    m_sync->join();
 
     // Clear all queues
     // If there are constant emitters, internal queues
@@ -1352,7 +1783,10 @@ void cv::gimpl::GStreamingExecutor::wait_shutdown()
     for (auto &q : m_emitter_queues) q.clear();
     for (auto &q : m_sink_queues) q->clear();
     for (auto &q : m_internal_queues) q->clear();
+    m_const_emitter_queues.clear();
+    m_const_vals.clear();
     m_out_queue.clear();
+    m_sync->clear();
 
     for (auto &&op : m_ops) {
         op.isl_exec->handleStopStream();
@@ -1363,6 +1797,9 @@ void cv::gimpl::GStreamingExecutor::wait_shutdown()
 
 bool cv::gimpl::GStreamingExecutor::pull(cv::GRunArgsP &&outs)
 {
+    GAPI_ITT_STATIC_LOCAL_HANDLE(pull_hndl, "GStreamingExecutor::pull");
+    GAPI_ITT_AUTO_TRACE_GUARD(pull_hndl);
+
     // This pull() can only be called when there's no desynchronized
     // parts in the graph.
     GAPI_Assert(!m_desync &&
@@ -1376,16 +1813,24 @@ bool cv::gimpl::GStreamingExecutor::pull(cv::GRunArgsP &&outs)
 
     Cmd cmd;
     m_out_queue.pop(cmd);
-    if (cv::util::holds_alternative<Stop>(cmd))
-    {
-        wait_shutdown();
-        return false;
+    switch (cmd.index()) {
+        case Cmd::index_of<Stop>():
+            wait_shutdown();
+            return false;
+        case Cmd::index_of<Result>(): {
+            GAPI_Assert(cv::util::holds_alternative<Result>(cmd));
+            cv::GRunArgs &this_result = cv::util::get<Result>(cmd).args;
+            sync_data(this_result, outs);
+            return true;
+        }
+        case Cmd::index_of<Exception>(): {
+            std::rethrow_exception(cv::util::get<Exception>(cmd).eptr);
+            return true;
+        }
+        default:
+            GAPI_Error("Unsupported cmd type in pull");
     }
-
-    GAPI_Assert(cv::util::holds_alternative<Result>(cmd));
-    cv::GRunArgs &this_result = cv::util::get<Result>(cmd).args;
-    sync_data(this_result, outs);
-    return true;
+    GAPI_Error("Unreachable code");
 }
 
 bool cv::gimpl::GStreamingExecutor::pull(cv::GOptRunArgsP &&outs)
@@ -1403,17 +1848,47 @@ bool cv::gimpl::GStreamingExecutor::pull(cv::GOptRunArgsP &&outs)
 
     Cmd cmd;
     m_out_queue.pop(cmd);
-    if (cv::util::holds_alternative<Stop>(cmd))
-    {
-        wait_shutdown();
-        return false;
+    switch (cmd.index()) {
+        case Cmd::index_of<Stop>():
+            wait_shutdown();
+            return false;
+        case Cmd::index_of<Result>(): {
+            sync_data(cv::util::get<Result>(cmd), outs);
+            return true;
+        }
+        case Cmd::index_of<Exception>(): {
+            std::rethrow_exception(cv::util::get<Exception>(cmd).eptr);
+            return true;
+        }
     }
-
-    GAPI_Assert(cv::util::holds_alternative<Result>(cmd));
-    sync_data(cv::util::get<Result>(cmd), outs);
-    return true;
+    GAPI_Error("Unreachable code");
 }
 
+cv::gimpl::GAbstractStreamingExecutor::PyPullResult cv::gimpl::GStreamingExecutor::pull()
+{
+    using RunArgs = cv::util::variant<cv::GRunArgs, cv::GOptRunArgs>;
+    bool is_over = false;
+
+    if (m_desync) {
+        GOptRunArgs opt_run_args;
+        GOptRunArgsP opt_outs;
+        opt_outs.reserve(out_info.size());
+        opt_run_args.reserve(out_info.size());
+
+        constructOptGraphOutputs(out_info, opt_run_args, opt_outs);
+        is_over = pull(std::move(opt_outs));
+        return std::make_tuple(is_over, RunArgs(opt_run_args));
+    }
+
+    GRunArgs run_args;
+    GRunArgsP outs;
+    run_args.reserve(out_info.size());
+    outs.reserve(out_info.size());
+
+    constructGraphOutputs(out_info, run_args, outs);
+    is_over = pull(std::move(outs));
+    return std::make_tuple(is_over, RunArgs(run_args));
+}
 
 bool cv::gimpl::GStreamingExecutor::try_pull(cv::GRunArgsP &&outs)
 {
@@ -1450,6 +1925,11 @@ void cv::gimpl::GStreamingExecutor::stop()
     // need to read the output queues until Stop!
     for (auto &q : m_emitter_queues) {
         q.push(stream::Cmd{stream::Stop{}});
+    }
+    // Also kindly ask emitter object to halt to break the blocking src->pull()
+    // loop
+    for (auto &nh : m_emitters) {
+        m_gim.metadata(nh).get<Emitter>().object->halt();
     }
 
     // Pull messages from the final queue to ensure completion

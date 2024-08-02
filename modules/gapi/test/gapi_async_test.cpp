@@ -13,6 +13,7 @@
 
 #include <condition_variable>
 #include <stdexcept>
+#include <thread>
 
 namespace opencv_test
 {
@@ -206,7 +207,7 @@ struct CallBack: crtp_cast<crtp_final_t> {
             mtx.unlock();
             cv.notify_one();
         };
-    };
+    }
 
     template<typename... Args >
     void start_async(Args&&... args){
@@ -356,7 +357,12 @@ template<typename case_t>
 struct cancel : ::testing::Test{};
 TYPED_TEST_CASE_P(cancel);
 
-TYPED_TEST_P(cancel, basic){
+TYPED_TEST_P(cancel, basic)
+{
+#if defined(__GNUC__) && __GNUC__ >= 11
+    // std::vector<TypeParam> requests can't handle type with ctor parameter (SelfCanceling)
+    FAIL() << "Test code is not available due to compilation error with GCC 11";
+#else
     constexpr int num_tasks = 100;
     cancel_struct cancel_struct_ {num_tasks};
     std::vector<TypeParam> requests; requests.reserve(num_tasks);
@@ -378,6 +384,7 @@ TYPED_TEST_P(cancel, basic){
         }
     }
     ASSERT_GT(canceled, 0u);
+#endif
 }
 
 namespace {

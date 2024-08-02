@@ -5,7 +5,10 @@ import org.opencv.core.Mat;
 import org.opencv.objdetect.QRCodeDetector;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.test.OpenCVTestCase;
+import java.util.Arrays;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 
 public class QRCodeDetectorTest extends OpenCVTestCase {
 
@@ -16,9 +19,14 @@ public class QRCodeDetectorTest extends OpenCVTestCase {
     protected void setUp() throws Exception {
         super.setUp();
 
-        testDataPath = System.getenv(ENV_OPENCV_TEST_DATA_PATH);
-        if (testDataPath == null)
-            throw new Exception(ENV_OPENCV_TEST_DATA_PATH + " has to be defined!");
+        // relys on https://developer.android.com/reference/java/lang/System
+        isTestCaseEnabled = System.getProperties().getProperty("java.vm.name") != "Dalvik";
+
+        if (isTestCaseEnabled) {
+            testDataPath = System.getenv(ENV_OPENCV_TEST_DATA_PATH);
+            if (testDataPath == null)
+                throw new Exception(ENV_OPENCV_TEST_DATA_PATH + " has to be defined!");
+        }
     }
 
     public void testDetectAndDecode() {
@@ -39,11 +47,7 @@ public class QRCodeDetectorTest extends OpenCVTestCase {
         boolean result = detector.detectAndDecodeMulti(img, output);
         assertTrue(result);
         assertEquals(output.size(), 6);
-        assertEquals(output.get(0), "SKIP");
-        assertEquals(output.get(1), "EXTRA");
-        assertEquals(output.get(2), "TWO STEPS FORWARD");
-        assertEquals(output.get(3), "STEP BACK");
-        assertEquals(output.get(4), "QUESTION");
-        assertEquals(output.get(5), "STEP FORWARD");
+        List < String > expectedResults = Arrays.asList("SKIP", "EXTRA", "TWO STEPS FORWARD", "STEP BACK", "QUESTION", "STEP FORWARD");
+        assertEquals(new HashSet<String>(output), new HashSet<String>(expectedResults));
     }
 }

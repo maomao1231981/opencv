@@ -1,47 +1,8 @@
-/*M///////////////////////////////////////////////////////////////////////////////////////
-//
-//  IMPORTANT: READ BEFORE DOWNLOADING, COPYING, INSTALLING OR USING.
-//
-//  By downloading, copying, installing or using the software you agree to this license.
-//  If you do not agree to this license, do not download, install,
-//  copy or use the software.
-//
-//
-//                           License Agreement
-//                For Open Source Computer Vision Library
-//
-// Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
-// Copyright (C) 2009, Willow Garage Inc., all rights reserved.
-// Third party copyrights are property of their respective owners.
-//
-// Redistribution and use in source and binary forms, with or without modification,
-// are permitted provided that the following conditions are met:
-//
-//   * Redistribution's of source code must retain the above copyright notice,
-//     this list of conditions and the following disclaimer.
-//
-//   * Redistribution's in binary form must reproduce the above copyright notice,
-//     this list of conditions and the following disclaimer in the documentation
-//     and/or other materials provided with the distribution.
-//
-//   * The name of the copyright holders may not be used to endorse or promote products
-//     derived from this software without specific prior written permission.
-//
-// This software is provided by the copyright holders and contributors "as is" and
-// any express or implied warranties, including, but not limited to, the implied
-// warranties of merchantability and fitness for a particular purpose are disclaimed.
-// In no event shall the Intel Corporation or contributors be liable for any direct,
-// indirect, incidental, special, exemplary, or consequential damages
-// (including, but not limited to, procurement of substitute goods or services;
-// loss of use, data, or profits; or business interruption) however caused
-// and on any theory of liability, whether in contract, strict liability,
-// or tort (including negligence or otherwise) arising in any way out of
-// the use of this software, even if advised of the possibility of such damage.
-//
-//M*/
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 
 #include "test_precomp.hpp"
-#include "opencv2/videoio/videoio_c.h"
 
 namespace opencv_test
 {
@@ -105,6 +66,11 @@ public:
         {
             std::cout << "CAP_PROP_FRAME_COUNT is not supported by backend. Assume 50 frames." << std::endl;
             n_frames = 50;
+        }
+        // GStreamer can't read frame count of big_buck_bunny.wmv
+        if (apiPref == CAP_GSTREAMER && ext == "wmv")
+        {
+            n_frames = 125;
         }
 
         {
@@ -205,7 +171,7 @@ public:
         EXPECT_NO_THROW(count_prop = (int)cap.get(CAP_PROP_FRAME_COUNT));
         // mpg file reports 5.08 sec * 24 fps => property returns 122 frames
         // but actual number of frames returned is 125
-        if (ext != "mpg")
+        if (ext != "mpg" && !(apiPref == CAP_GSTREAMER && ext == "wmv"))
         {
             if (count_prop > 0)
             {
@@ -239,12 +205,11 @@ public:
         if (!isBackendAvailable(apiPref, cv::videoio_registry::getStreamBackends()))
             throw SkipTestException(cv::String("Backend is not available/disabled: ") + cv::videoio_registry::getBackendName(apiPref));
 
-        // GStreamer: https://github.com/opencv/opencv/issues/19025
-        if (apiPref == CAP_GSTREAMER)
+        if (((apiPref == CAP_GSTREAMER) && (ext == "avi")))
             throw SkipTestException(cv::String("Backend ") +  cv::videoio_registry::getBackendName(apiPref) +
-                    cv::String(" does not return reliable values for CAP_PROP_POS_MSEC property"));
+                    cv::String(" does not support CAP_PROP_POS_MSEC option"));
 
-        if (((apiPref == CAP_FFMPEG) && ((ext == "h264") || (ext == "h265"))))
+        if (((apiPref == CAP_FFMPEG || apiPref == CAP_GSTREAMER) && ((ext == "h264") || (ext == "h265"))))
             throw SkipTestException(cv::String("Backend ") +  cv::videoio_registry::getBackendName(apiPref) +
                     cv::String(" does not support CAP_PROP_POS_MSEC option"));
 
@@ -254,8 +219,24 @@ public:
             throw SkipTestException(cv::String("Backend ") +  cv::videoio_registry::getBackendName(apiPref) +
                     cv::String(" can't open the video: ")  + video_file);
 
+        int frame_count = (int)cap.get(CAP_PROP_FRAME_COUNT);
+
+        // HACK: Video consists of 125 frames, but cv::VideoCapture with FFmpeg reports only 122 frames for mpg video.
+        // mpg file reports 5.08 sec * 24 fps => property returns 122 frames,but actual number of frames returned is 125
+        // HACK: CAP_PROP_FRAME_COUNT is not supported for vmw + MSMF. Just force check for all 125 frames
+        if (ext == "mpg")
+            EXPECT_GE(frame_count, 114);
+        else if ((ext == "wmv") && (apiPref == CAP_MSMF || apiPref == CAP_GSTREAMER))
+            frame_count = 125;
+        else
+            EXPECT_EQ(frame_count, 125);
         Mat img;
-        for(int i = 0; i < 10; i++)
+
+        // HACK: FFmpeg reports picture_pts = AV_NOPTS_VALUE_ for the last frame for AVI container by some reason
+        if ((ext == "avi") && (apiPref == CAP_FFMPEG))
+            frame_count--;
+
+        for (int i = 0; i < frame_count; i++)
         {
             double timestamp = 0;
             ASSERT_NO_THROW(cap >> img);
@@ -263,7 +244,10 @@ public:
             if (cvtest::debugLevel > 0)
                 std::cout << "i = " << i << ": timestamp = " << timestamp << std::endl;
             const double frame_period = 1000.f/bunny_param.getFps();
-            // NOTE: eps == frame_period, because videoCapture returns frame begining timestamp or frame end
+            // big_buck_bunny.mpg starts at 0.500 msec
+            if ((ext == "mpg") && (apiPref == CAP_GSTREAMER))
+                timestamp -= 500.0;
+            // NOTE: eps == frame_period, because videoCapture returns frame beginning timestamp or frame end
             // timestamp depending on codec and back-end. So the first frame has timestamp 0 or frame_period.
             EXPECT_NEAR(timestamp, i*frame_period, frame_period) << "i=" << i;
         }
@@ -411,6 +395,7 @@ static Ext_Fourcc_PSNR synthetic_params[] = {
     {"wmv", "WMV3", 30.f, CAP_MSMF},
     {"wmv", "WVC1", 30.f, CAP_MSMF},
     {"mov", "H264", 30.f, CAP_MSMF},
+ // {"mov", "HEVC", 30.f, CAP_MSMF},  // excluded due to CI issue: https://github.com/opencv/opencv/pull/23172
 #endif
 
 #ifdef HAVE_AVFOUNDATION
@@ -430,6 +415,8 @@ static Ext_Fourcc_PSNR synthetic_params[] = {
     {"mkv", "XVID", 30.f, CAP_FFMPEG},
     {"mkv", "MPEG", 30.f, CAP_FFMPEG},
     {"mkv", "MJPG", 30.f, CAP_FFMPEG},
+    {"avi", "FFV1", 30.f, CAP_FFMPEG},
+    {"mkv", "FFV1", 30.f, CAP_FFMPEG},
 
     {"avi", "MPEG", 28.f, CAP_GSTREAMER},
     {"avi", "MJPG", 30.f, CAP_GSTREAMER},
@@ -675,7 +662,6 @@ TEST_P(videocapture_acceleration, read)
     VideoCaptureAPIs backend = get<1>(param);
     VideoAccelerationType va_type = get<2>(param);
     bool use_umat = get<3>(param);
-    int device_idx = -1;
     const int frameNum = 15;
 
     std::string filepath = cvtest::findDataFile("video/" + filename);
@@ -695,13 +681,24 @@ TEST_P(videocapture_acceleration, read)
 
 
     // HW reader
-    VideoCapture hw_reader(filepath, backend, {
-            CAP_PROP_HW_ACCELERATION, static_cast<int>(va_type),
-            CAP_PROP_HW_DEVICE, device_idx
-    });
+    std::vector<int> params = { CAP_PROP_HW_ACCELERATION, static_cast<int>(va_type) };
+    if (use_umat)
+    {
+        if (backend != CAP_FFMPEG)
+            throw SkipTestException(cv::String("UMat/OpenCL mapping is not supported by current backend: ") + backend_name);
+        if (!cv::videoio_registry::isBackendBuiltIn(backend))
+            throw SkipTestException(cv::String("UMat/OpenCL mapping is not supported through plugins yet: ") + backend_name);
+        params.push_back(CAP_PROP_HW_ACCELERATION_USE_OPENCL);
+        params.push_back(1);
+    }
+    VideoCapture hw_reader(filepath, backend, params);
     if (!hw_reader.isOpened())
     {
-        if (va_type == VIDEO_ACCELERATION_ANY || va_type == VIDEO_ACCELERATION_NONE)
+        if (use_umat)
+        {
+            throw SkipTestException(backend_name + " VideoCapture on " + filename + " not supported with HW acceleration + OpenCL/Umat mapping, skipping");
+        }
+        else if (va_type == VIDEO_ACCELERATION_ANY || va_type == VIDEO_ACCELERATION_NONE)
         {
             // ANY HW acceleration should have fallback to SW codecs
             VideoCapture sw_reader(filepath, backend, {
@@ -733,13 +730,45 @@ TEST_P(videocapture_acceleration, read)
         if (use_umat)
         {
             UMat umat;
-            EXPECT_TRUE(hw_reader.read(umat));
+            bool read_umat_result = hw_reader.read(umat);
+            if (!read_umat_result && i == 0)
+            {
+                if (filename == "sample_322x242_15frames.yuv420p.libvpx-vp9.mp4")
+                    throw SkipTestException("Unable to read the first frame with VP9 codec (media stack misconfiguration / bug)");
+                // FFMPEG: [av1 @ 0000027ac07d1340] Your platform doesn't suppport hardware accelerated AV1 decoding.
+                if (filename == "sample_322x242_15frames.yuv420p.libaom-av1.mp4")
+                    throw SkipTestException("Unable to read the first frame with AV1 codec (missing support)");
+            }
+#ifdef _WIN32
+            if (!read_umat_result && i == 1)
+            {
+                if (filename == "sample_322x242_15frames.yuv420p.libvpx-vp9.mp4")
+                    throw SkipTestException("Unable to read the second frame with VP9 codec (media stack misconfiguration / outdated MSMF version)");
+            }
+#endif
+            EXPECT_TRUE(read_umat_result);
             ASSERT_FALSE(umat.empty());
             umat.copyTo(frame);
         }
         else
         {
-            EXPECT_TRUE(hw_reader.read(frame));
+            bool read_result = hw_reader.read(frame);
+            if (!read_result && i == 0)
+            {
+                if (filename == "sample_322x242_15frames.yuv420p.libvpx-vp9.mp4")
+                    throw SkipTestException("Unable to read the first frame with VP9 codec (media stack misconfiguration / bug)");
+                // FFMPEG: [av1 @ 0000027ac07d1340] Your platform doesn't suppport hardware accelerated AV1 decoding.
+                if (filename == "sample_322x242_15frames.yuv420p.libaom-av1.mp4")
+                    throw SkipTestException("Unable to read the first frame with AV1 codec (missing support)");
+            }
+#ifdef _WIN32
+            if (!read_result && i == 1)
+            {
+                if (filename == "sample_322x242_15frames.yuv420p.libvpx-vp9.mp4")
+                    throw SkipTestException("Unable to read the second frame with VP9 codec (media stack misconfiguration / outdated MSMF version)");
+            }
+#endif
+            EXPECT_TRUE(read_result);
         }
         ASSERT_FALSE(frame.empty());
 
@@ -768,8 +797,8 @@ static const VideoCaptureAccelerationInput hw_filename[] = {
         { "sample_322x242_15frames.yuv420p.libxvid.mp4", 28.0 },
         { "sample_322x242_15frames.yuv420p.mjpeg.mp4", 20.0 },
         { "sample_322x242_15frames.yuv420p.mpeg2video.mp4", 24.0 },  // GSTREAMER on Ubuntu 18.04
-        { "sample_322x242_15frames.yuv420p.libx264.mp4", 24.0 },  // GSTREAMER on Ubuntu 18.04
-        { "sample_322x242_15frames.yuv420p.libx265.mp4", 30.0 },
+        { "sample_322x242_15frames.yuv420p.libx264.mp4", 20.0 },  // 20 - D3D11 (i7-11800H), 23 - D3D11 on GHA/Windows, GSTREAMER on Ubuntu 18.04
+        { "sample_322x242_15frames.yuv420p.libx265.mp4", 20.0 },  // 20 - D3D11 (i7-11800H), 23 - D3D11 on GHA/Windows
         { "sample_322x242_15frames.yuv420p.libvpx-vp9.mp4", 30.0 },
         { "sample_322x242_15frames.yuv420p.libaom-av1.mp4", 30.0 }
 };
@@ -795,7 +824,7 @@ static const VideoAccelerationType hw_types[] = {
 
 static bool hw_use_umat[] = {
         false,
-        //true
+        true
 };
 
 INSTANTIATE_TEST_CASE_P(videoio, videocapture_acceleration, testing::Combine(
@@ -819,7 +848,6 @@ TEST_P(videowriter_acceleration, write)
     std::string extension = get<0>(param).ext;
     double psnr_threshold = get<0>(param).PSNR;
     VideoAccelerationType va_type = get<1>(param);
-    int device_idx = -1;
     bool use_umat = get<2>(param);
     std::string backend_name = cv::videoio_registry::getBackendName(backend);
     if (!videoio_registry::hasBackend(backend))
@@ -834,20 +862,31 @@ TEST_P(videowriter_acceleration, write)
     // Write video
     VideoAccelerationType actual_va;
     {
+        std::vector<int> params = { VIDEOWRITER_PROP_HW_ACCELERATION, static_cast<int>(va_type) };
+        if (use_umat) {
+            if (backend != CAP_FFMPEG)
+                throw SkipTestException(cv::String("UMat/OpenCL mapping is not supported by current backend: ") + backend_name);
+            if (!cv::videoio_registry::isBackendBuiltIn(backend))
+                throw SkipTestException(cv::String("UMat/OpenCL mapping is not supported through plugins yet: ") + backend_name);
+            params.push_back(VIDEOWRITER_PROP_HW_ACCELERATION_USE_OPENCL);
+            params.push_back(1);
+        }
         VideoWriter hw_writer(
             filename,
             backend,
             VideoWriter::fourcc(codecid[0], codecid[1], codecid[2], codecid[3]),
             fps,
             sz,
-            {
-                VIDEOWRITER_PROP_HW_ACCELERATION, static_cast<int>(va_type),
-                VIDEOWRITER_PROP_HW_DEVICE, device_idx
-            }
+            params
         );
 
-        if (!hw_writer.isOpened()) {
-            if (va_type == VIDEO_ACCELERATION_ANY || va_type == VIDEO_ACCELERATION_NONE)
+        if (!hw_writer.isOpened())
+        {
+            if (use_umat)
+            {
+                throw SkipTestException(backend_name + " VideoWriter on " + filename + " not supported with HW acceleration + OpenCL/Umat mapping, skipping");
+            }
+            else if (va_type == VIDEO_ACCELERATION_ANY || va_type == VIDEO_ACCELERATION_NONE)
             {
                 // ANY HW acceleration should have fallback to SW codecs
                 {
@@ -960,6 +999,7 @@ static Ext_Fourcc_PSNR hw_codecs[] = {
 #ifdef _WIN32
         {"mp4", "MPEG", 29.f, CAP_MSMF},
         {"mp4", "H264", 29.f, CAP_MSMF},
+        {"mp4", "HEVC", 29.f, CAP_MSMF},
 #endif
 };
 

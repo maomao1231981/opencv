@@ -1,12 +1,24 @@
+set(VIDEOIO_ENABLE_PLUGINS_DEFAULT ON)
+if(EMSCRIPTEN OR IOS OR XROS OR WINRT)
+  set(VIDEOIO_ENABLE_PLUGINS_DEFAULT OFF)
+endif()
+
 set(VIDEOIO_PLUGIN_LIST "" CACHE STRING "List of videoio backends to be compiled as plugins (ffmpeg, gstreamer, mfx, msmf or special value 'all')")
-set(VIDEOIO_ENABLE_PLUGINS "ON" CACHE BOOL "Allow building videoio plugin support")
+set(VIDEOIO_ENABLE_PLUGINS "${VIDEOIO_ENABLE_PLUGINS_DEFAULT}" CACHE BOOL "Allow building and using of videoio plugins")
 mark_as_advanced(VIDEOIO_PLUGIN_LIST VIDEOIO_ENABLE_PLUGINS)
 
 string(REPLACE "," ";" VIDEOIO_PLUGIN_LIST "${VIDEOIO_PLUGIN_LIST}")  # support comma-separated list (,) too
-
-# Make virtual opencv_videoio_plugins target
-if(NOT TARGET opencv_videoio_plugins)
-  add_custom_target(opencv_videoio_plugins ALL)
+string(TOLOWER "${VIDEOIO_PLUGIN_LIST}" VIDEOIO_PLUGIN_LIST)
+if(NOT VIDEOIO_ENABLE_PLUGINS)
+  if(VIDEOIO_PLUGIN_LIST)
+    message(WARNING "VideoIO: plugins are disabled through VIDEOIO_ENABLE_PLUGINS, so VIDEOIO_PLUGIN_LIST='${VIDEOIO_PLUGIN_LIST}' is ignored")
+    set(VIDEOIO_PLUGIN_LIST "")
+  endif()
+else()
+  # Make virtual opencv_videoio_plugins target
+  if(NOT TARGET opencv_videoio_plugins)
+    add_custom_target(opencv_videoio_plugins ALL)
+  endif()
 endif()
 
 ocv_add_module(videoio opencv_imgproc opencv_imgcodecs WRAP java objc python)
@@ -36,6 +48,9 @@ endif()
 
 # Removing WinRT API headers by default
 list(REMOVE_ITEM videoio_ext_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/${name}/cap_winrt.hpp")
+
+# Remove iOS API header by default
+list(REMOVE_ITEM videoio_ext_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/${name}/cap_ios.h")
 
 if(DEFINED WINRT AND NOT DEFINED ENABLE_WINRT_MODE_NATIVE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /ZW")
@@ -69,7 +84,7 @@ endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/plugin.cmake)
 
-set(tgts)
+set(tgts "PRIVATE")
 
 if(TARGET ocv.3rdparty.mediasdk)
   if("mfx" IN_LIST VIDEOIO_PLUGIN_LIST OR VIDEOIO_PLUGIN_LIST STREQUAL "all")
@@ -151,10 +166,26 @@ if(TARGET ocv.3rdparty.ffmpeg)
     list(APPEND tgts ocv.3rdparty.ffmpeg)
   elseif("ffmpeg" IN_LIST VIDEOIO_PLUGIN_LIST OR VIDEOIO_PLUGIN_LIST STREQUAL "all")
     ocv_create_builtin_videoio_plugin("opencv_videoio_ffmpeg" ocv.3rdparty.ffmpeg "cap_ffmpeg.cpp")
+    if(TARGET ocv.3rdparty.ffmpeg.plugin_deps)
+      ocv_target_link_libraries(opencv_videoio_ffmpeg ocv.3rdparty.ffmpeg.plugin_deps)
+    endif()
+    if(TARGET ocv.3rdparty.mediasdk
+        AND NOT OPENCV_FFMPEG_DISABLE_MEDIASDK
+    )
+      ocv_target_link_libraries(opencv_videoio_ffmpeg ocv.3rdparty.mediasdk)
+    endif()
   else()
     list(APPEND videoio_hdrs ${CMAKE_CURRENT_LIST_DIR}/src/cap_ffmpeg_impl.hpp)
     list(APPEND videoio_srcs ${CMAKE_CURRENT_LIST_DIR}/src/cap_ffmpeg.cpp)
     list(APPEND tgts ocv.3rdparty.ffmpeg)
+    if(TARGET ocv.3rdparty.ffmpeg.builtin_deps)
+      list(APPEND tgts ocv.3rdparty.ffmpeg.builtin_deps)
+    endif()
+    if(TARGET ocv.3rdparty.mediasdk
+        AND NOT OPENCV_FFMPEG_DISABLE_MEDIASDK
+    )
+      list(APPEND tgts ocv.3rdparty.mediasdk)
+    endif()
   endif()
 endif()
 
@@ -169,7 +200,7 @@ if(TARGET ocv.3rdparty.aravis)
 endif()
 
 if(TARGET ocv.3rdparty.avfoundation)
-  if(IOS)
+  if(IOS OR XROS)
     list(APPEND videoio_srcs ${CMAKE_CURRENT_LIST_DIR}/src/cap_avfoundation.mm)
   else()
     list(APPEND videoio_srcs ${CMAKE_CURRENT_LIST_DIR}/src/cap_avfoundation_mac.mm)
@@ -193,6 +224,7 @@ if(TARGET ocv.3rdparty.cap_ios)
     ${CMAKE_CURRENT_LIST_DIR}/src/cap_ios_photo_camera.mm
     ${CMAKE_CURRENT_LIST_DIR}/src/cap_ios_video_camera.mm)
   list(APPEND tgts ocv.3rdparty.cap_ios)
+  list(APPEND videoio_ext_hdrs "${CMAKE_CURRENT_LIST_DIR}/include/opencv2/${name}/cap_ios.h")
 endif()
 
 if(TARGET ocv.3rdparty.android_mediandk)
@@ -206,6 +238,42 @@ if(TARGET ocv.3rdparty.android_native_camera)
     ${CMAKE_CURRENT_LIST_DIR}/src/cap_android_camera.cpp)
   list(APPEND tgts ocv.3rdparty.android_native_camera)
 endif()
+
+if(TARGET ocv.3rdparty.obsensor)
+if(OBSENSOR_USE_ORBBEC_SDK)
+    list(APPEND videoio_srcs
+      ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor_liborbbec.hpp
+      ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor_liborbbec.cpp)
+  else()
+    list(APPEND videoio_srcs
+      ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor_capture.cpp)
+    list(APPEND videoio_hdrs
+      ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor_capture.hpp
+      ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_stream_channel_interface.hpp)
+    if(HAVE_OBSENSOR_MSMF)
+      list(APPEND videoio_srcs
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_uvc_stream_channel.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_stream_channel_msmf.cpp)
+      list(APPEND videoio_hdrs
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_uvc_stream_channel.hpp
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_stream_channel_msmf.hpp)
+    elseif(HAVE_OBSENSOR_V4L2)
+      list(APPEND videoio_srcs
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_uvc_stream_channel.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_stream_channel_v4l2.cpp)
+      list(APPEND videoio_hdrs
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_uvc_stream_channel.hpp
+        ${CMAKE_CURRENT_LIST_DIR}/src/cap_obsensor/obsensor_stream_channel_v4l2.hpp)
+    endif()
+  endif()
+  list(APPEND tgts ocv.3rdparty.obsensor)
+endif()
+
+if(tgts STREQUAL "PRIVATE")
+  set(tgts "")
+endif()
+
+ocv_install_used_external_targets(${tgts})
 
 ocv_set_module_sources(HEADERS ${videoio_ext_hdrs} ${videoio_hdrs} SOURCES ${videoio_srcs})
 ocv_module_include_directories()

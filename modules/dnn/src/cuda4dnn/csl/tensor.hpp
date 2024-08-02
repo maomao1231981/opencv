@@ -265,7 +265,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
         ::type reshape(ForwardItr start, ForwardItr end) {
             CV_Assert(start != end);
-            CV_Assert(std::distance(start, end) <= rank());
 
             using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
 
@@ -284,6 +283,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             auto total = std::accumulate(start, end, 1, std::multiplies<ItrValueType>());
             if (total < 0) {
                 /* there is an unknown size */
+                CV_CheckEQ(size() % std::abs(total), static_cast<size_type>(0), "cannot be reshaped"); // must be divisible
                 if (std::abs(total) <= size()) {
                     unknown_size = size() / std::abs(total);
                     total = size();
@@ -298,11 +298,9 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
                 CV_Error(Error::StsBadArg, "new axes do not preserve the tensor element count");
             }
 
-            /* we assume the size of the unspecified axes to be one */
-            std::fill(std::begin(shape), std::end(shape), 1);
-            std::copy_backward(start, end, std::end(shape));
-
-            /* replace the unknown axis with the correct value */
+            /* copy shape from given iterator and reshape -1 with deduced value */
+            shape.resize(std::distance(start, end));
+            std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
         }
 
@@ -367,6 +365,26 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             axis = clamp_axis(axis, rank());
             CV_Assert(axis >= 0 && axis < rank());
             shape.erase(std::begin(shape) + axis);
+        }
+
+        /** @brief squeezes the tensor
+         *
+         * removes leading singleton axes until the tensor's rank is equal to the requested rank
+         *
+         * Pre-conditions:
+         * - the tensor must be non-empty
+         * - the tensor's rank must be at least two
+         * - the tensor's rank must be at least the requested rank
+         * - the tensor must be squeezable up to the requested rank
+         *
+         * Exception Guarantee: Strong
+         */
+        void squeeze_to(int r) {
+            CV_Assert(!empty());
+            CV_Assert(rank() >= r);
+            CV_Assert(std::all_of(std::begin(shape), std::end(shape) - r, [](size_type x){ return x == 1; }));
+            std::copy(std::end(shape) - r, std::end(shape), std::begin(shape));
+            shape.resize(r);
         }
 
         /** @brief unsqueezes the tensor
@@ -580,6 +598,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             auto total = std::accumulate(start, end, 1, std::multiplies<ItrValueType>());
             if (total < 0) {
                 /* there is an unknown size */
+                CV_CheckEQ(size() % std::abs(total), static_cast<size_type>(0), "cannot be reshaped"); // must be divisible
                 if (std::abs(total) <= size()) {
                     unknown_size = size() / std::abs(total);
                     total = size();
@@ -594,11 +613,9 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
                CV_Error(Error::StsBadArg, "new axes do not preserve the tensor element count");
             }
 
-            /* we assume the size of the unspecified axes to be one */
-            std::fill(std::begin(shape), std::end(shape), 1);
-            std::copy_backward(start, end, std::end(shape));
-
-            /* replace the unknown axis with the correct value */
+            /* copy shape from given iterator and reshape -1 with deduced value */
+            shape.resize(std::distance(start, end));
+            std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
         }
 
@@ -663,6 +680,26 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             axis = clamp_axis(axis, rank());
             CV_Assert(axis >= 0 && axis < rank());
             shape.erase(std::begin(shape) + axis);
+        }
+
+        /** @brief squeezes the tensor
+         *
+         * removes leading singleton axes until the tensor's rank is equal to the requested rank
+         *
+         * Pre-conditions:
+         * - the tensor must be non-empty
+         * - the tensor's rank must be at least two
+         * - the tensor's rank must be at least the requested rank
+         * - the tensor must be squeezable up to the requested rank
+         *
+         * Exception Guarantee: Strong
+         */
+        void squeeze_to(int r) {
+            CV_Assert(!empty());
+            CV_Assert(rank() >= r);
+            CV_Assert(std::all_of(std::begin(shape), std::end(shape) - r, [](size_type x){ return x == 1; }));
+            std::copy(std::end(shape) - r, std::end(shape), std::begin(shape));
+            shape.resize(r);
         }
 
         /** @brief unsqueezes the tensor
@@ -906,7 +943,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         typename std::enable_if<!std::is_integral<ForwardItr>::value, void>
         ::type reshape(ForwardItr start, ForwardItr end) {
             CV_Assert(start != end);
-            CV_Assert(std::distance(start, end) <= rank());
 
             using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
 
@@ -925,6 +961,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             auto total = std::accumulate(start, end, 1, std::multiplies<ItrValueType>());
             if (total < 0) {
                 /* there is an unknown size */
+                CV_CheckEQ(size() % std::abs(total), static_cast<size_type>(0), "cannot be reshaped"); // must be divisible
                 if (std::abs(total) <= size()) {
                     unknown_size = size() / std::abs(total);
                     total = size();
@@ -939,11 +976,9 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
                 CV_Error(Error::StsBadArg, "new axes do not preserve the tensor element count");
             }
 
-            /* we assume the size of the unspecified axes to be one */
-            std::fill(std::begin(shape), std::end(shape), 1);
-            std::copy_backward(start, end, std::end(shape));
-
-            /* replace the unknown axis with the correct value */
+            /* copy shape from given iterator and reshape -1 with deduced value */
+            shape.resize(std::distance(start, end));
+            std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
         }
 
@@ -1008,6 +1043,26 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             axis = clamp_axis(axis, rank());
             CV_Assert(axis >= 0 && axis < rank());
             shape.erase(std::begin(shape) + axis);
+        }
+
+        /** @brief squeezes the tensor
+         *
+         * removes leading singleton axes until the tensor's rank is equal to the requested rank
+         *
+         * Pre-conditions:
+         * - the tensor must be non-empty
+         * - the tensor's rank must be at least two
+         * - the tensor's rank must be at least the requested rank
+         * - the tensor must be squeezable up to the requested rank
+         *
+         * Exception Guarantee: Strong
+         */
+        void squeeze_to(int r) {
+            CV_Assert(!empty());
+            CV_Assert(rank() >= r);
+            CV_Assert(std::all_of(std::begin(shape), std::end(shape) - r, [](size_type x){ return x == 1; }));
+            std::copy(std::end(shape) - r, std::end(shape), std::begin(shape));
+            shape.resize(r);
         }
 
         /** @brief unsqueezes the tensor
@@ -1124,6 +1179,23 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             if (x.get_axis_size(i) != y.get_axis_size(i) &&
                 x.get_axis_size(i) != 1 && y.get_axis_size(i) != 1)
                 return false;
+        return true;
+    }
+
+    template <typename ShapeType>
+    bool is_shape_compatible1(const ShapeType &x_shape, const ShapeType &y_shape) noexcept {
+        const auto x_ndims = x_shape.size(), y_ndims = y_shape.size();
+
+        if (x_ndims != y_ndims) {
+            return false;
+        }
+
+        for (int i = 0; i < x_ndims; i++) {
+            if (x_shape[i] != y_shape[i] && x_shape[i] != 1 && y_shape[i] != 1) {
+                 return false;
+            }
+        }
+
         return true;
     }
 

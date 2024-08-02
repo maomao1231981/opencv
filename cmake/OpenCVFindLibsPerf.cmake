@@ -29,7 +29,7 @@ if(WITH_IPP)
     if(OPENCV_FORCE_IPP_EXCLUDE_LIBS
         OR (HAVE_IPP_ICV
             AND UNIX AND NOT ANDROID AND NOT APPLE
-            AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|Intel"
         )
         AND NOT OPENCV_SKIP_IPP_EXCLUDE_LIBS
     )
@@ -40,7 +40,11 @@ endif()
 
 # --- CUDA ---
 if(WITH_CUDA)
-  include("${OpenCV_SOURCE_DIR}/cmake/OpenCVDetectCUDA.cmake")
+  if(ENABLE_CUDA_FIRST_CLASS_LANGUAGE)
+    include("${OpenCV_SOURCE_DIR}/cmake/OpenCVDetectCUDALanguage.cmake")
+  else()
+    include("${OpenCV_SOURCE_DIR}/cmake/OpenCVDetectCUDA.cmake")
+  endif()
   if(NOT HAVE_CUDA)
     message(WARNING "OpenCV is not able to find/configure CUDA SDK (required by WITH_CUDA).
 CUDA support will be disabled in OpenCV build.

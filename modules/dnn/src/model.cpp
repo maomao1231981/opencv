@@ -3,8 +3,10 @@
 // of this distribution and at http://opencv.org/license.html.
 
 #include "precomp.hpp"
+#include "math_utils.hpp"
 #include <algorithm>
 #include <utility>
+#include <unordered_map>
 #include <iterator>
 
 #include <opencv2/imgproc.hpp>
@@ -19,7 +21,7 @@ struct Model::Impl
 
     Size   size;
     Scalar mean;
-    double  scale = 1.0;
+    Scalar scale = Scalar::all(1.0);
     bool   swapRB = false;
     bool   crop = false;
     Mat    blob;
@@ -35,6 +37,7 @@ public:
 
     virtual void setPreferableBackend(Backend backendId) { net.setPreferableBackend(backendId); }
     virtual void setPreferableTarget(Target targetId) { net.setPreferableTarget(targetId); }
+    virtual void enableWinograd(bool useWinograd) { net.enableWinograd(useWinograd); }
 
     virtual
     void initNet(const Net& network)
@@ -58,7 +61,7 @@ public:
     {
         size = size_;
         mean = mean_;
-        scale = scale_;
+        scale = Scalar::all(scale_);
         crop = crop_;
         swapRB = swapRB_;
     }
@@ -73,7 +76,7 @@ public:
         mean = mean_;
     }
     /*virtual*/
-    void setInputScale(double scale_)
+    void setInputScale(const Scalar& scale_)
     {
         scale = scale_;
     }
@@ -87,6 +90,11 @@ public:
     {
         swapRB = swapRB_;
     }
+    /*virtual*/
+    void setOutputNames(const std::vector<String>& outNames_)
+    {
+        outNames = outNames_;
+    }
 
     /*virtual*/
     void processFrame(InputArray frame, OutputArrayOfArrays outs)
@@ -95,7 +103,17 @@ public:
         if (size.empty())
             CV_Error(Error::StsBadSize, "Input size not specified");
 
-        blob = blobFromImage(frame, scale, size, mean, swapRB, crop);
+        Image2BlobParams param;
+        param.scalefactor = scale;
+        param.size = size;
+        param.mean = mean;
+        param.swapRB = swapRB;
+        if (crop)
+        {
+            param.paddingmode = DNN_PMODE_CROP_CENTER;
+        }
+        Mat blob = dnn::blobFromImageWithParams(frame, param); // [1, 10, 10, 4]
+
         net.setInput(blob);
 
         // Faster-RCNN or R-FCN
@@ -139,10 +157,18 @@ Model& Model::setPreferableBackend(Backend backendId)
     impl->setPreferableBackend(backendId);
     return *this;
 }
+
 Model& Model::setPreferableTarget(Target targetId)
 {
     CV_DbgAssert(impl);
     impl->setPreferableTarget(targetId);
+    return *this;
+}
+
+Model& Model::enableWinograd(bool useWinograd)
+{
+    CV_DbgAssert(impl);
+    impl->enableWinograd(useWinograd);
     return *this;
 }
 
@@ -160,9 +186,11 @@ Model& Model::setInputMean(const Scalar& mean)
     return *this;
 }
 
-Model& Model::setInputScale(double scale)
+Model& Model::setInputScale(const Scalar& scale_)
 {
     CV_DbgAssert(impl);
+
+    Scalar scale = broadcastRealScalar(scale_);
     impl->setInputScale(scale);
     return *this;
 }
@@ -181,6 +209,13 @@ Model& Model::setInputSwapRB(bool swapRB)
     return *this;
 }
 
+Model& Model::setOutputNames(const std::vector<String>& outNames)
+{
+    CV_DbgAssert(impl);
+    impl->setOutputNames(outNames);
+    return *this;
+}
+
 void Model::setInputParams(double scale, const Size& size, const Scalar& mean,
                            bool swapRB, bool crop)
 {
@@ -195,28 +230,95 @@ void Model::predict(InputArray frame, OutputArrayOfArrays outs) const
 }
 
 
+class ClassificationModel_Impl : public Model::Impl
+{
+public:
+    virtual ~ClassificationModel_Impl() {}
+    ClassificationModel_Impl() : Impl() {}
+    ClassificationModel_Impl(const ClassificationModel_Impl&) = delete;
+    ClassificationModel_Impl(ClassificationModel_Impl&&) = delete;
+
+    void setEnableSoftmaxPostProcessing(bool enable)
+    {
+        applySoftmax = enable;
+    }
+
+    bool getEnableSoftmaxPostProcessing() const
+    {
+        return applySoftmax;
+    }
+
+    std::pair<int, float> classify(InputArray frame)
+    {
+        std::vector<Mat> outs;
+        processFrame(frame, outs);
+        CV_Assert(outs.size() == 1);
+
+        Mat out = outs[0].reshape(1, 1);
+
+        if(getEnableSoftmaxPostProcessing())
+        {
+            softmax(out, out);
+        }
+
+        double conf;
+        Point maxLoc;
+        cv::minMaxLoc(out, nullptr, &conf, nullptr, &maxLoc);
+        return {maxLoc.x, static_cast<float>(conf)};
+    }
+
+protected:
+    void softmax(InputArray inblob, OutputArray outblob)
+    {
+        const Mat input = inblob.getMat();
+        outblob.create(inblob.size(), inblob.type());
+
+        Mat exp;
+        const float max = *std::max_element(input.begin<float>(), input.end<float>());
+        cv::exp((input - max), exp);
+        outblob.getMat() = exp / cv::sum(exp)[0];
+    }
+
+protected:
+    bool applySoftmax = false;
+};
+
+ClassificationModel::ClassificationModel()
+    : Model()
+{
+    // nothing
+}
+
 ClassificationModel::ClassificationModel(const String& model, const String& config)
-    : Model(model, config)
+    : ClassificationModel(readNet(model, config))
 {
     // nothing
 }
 
 ClassificationModel::ClassificationModel(const Net& network)
-    : Model(network)
+    : Model()
 {
-    // nothing
+    impl = makePtr<ClassificationModel_Impl>();
+    impl->initNet(network);
+}
+
+ClassificationModel& ClassificationModel::setEnableSoftmaxPostProcessing(bool enable)
+{
+    CV_Assert(impl != nullptr && impl.dynamicCast<ClassificationModel_Impl>() != nullptr);
+    impl.dynamicCast<ClassificationModel_Impl>()->setEnableSoftmaxPostProcessing(enable);
+    return *this;
+}
+
+bool ClassificationModel::getEnableSoftmaxPostProcessing() const
+{
+    CV_Assert(impl != nullptr && impl.dynamicCast<ClassificationModel_Impl>() != nullptr);
+    return impl.dynamicCast<ClassificationModel_Impl>()->getEnableSoftmaxPostProcessing();
 }
 
 std::pair<int, float> ClassificationModel::classify(InputArray frame)
 {
-    std::vector<Mat> outs;
-    impl->processFrame(frame, outs);
-    CV_Assert(outs.size() == 1);
-
-    double conf;
-    cv::Point maxLoc;
-    minMaxLoc(outs[0].reshape(1, 1), nullptr, &conf, nullptr, &maxLoc);
-    return {maxLoc.x, static_cast<float>(conf)};
+    CV_Assert(impl != nullptr && impl.dynamicCast<ClassificationModel_Impl>() != nullptr);
+    return impl.dynamicCast<ClassificationModel_Impl>()->classify(frame);
 }
 
 void ClassificationModel::classify(InputArray frame, int& classId, float& conf)
@@ -225,9 +327,9 @@ void ClassificationModel::classify(InputArray frame, int& classId, float& conf)
 }
 
 KeypointsModel::KeypointsModel(const String& model, const String& config)
-    : Model(model, config) {};
+    : Model(model, config) {}
 
-KeypointsModel::KeypointsModel(const Net& network) : Model(network) {};
+KeypointsModel::KeypointsModel(const Net& network) : Model(network) {}
 
 std::vector<Point2f> KeypointsModel::estimate(InputArray frame, float thresh)
 {
@@ -283,15 +385,17 @@ std::vector<Point2f> KeypointsModel::estimate(InputArray frame, float thresh)
 }
 
 SegmentationModel::SegmentationModel(const String& model, const String& config)
-    : Model(model, config) {};
+    : Model(model, config) {}
 
-SegmentationModel::SegmentationModel(const Net& network) : Model(network) {};
+SegmentationModel::SegmentationModel(const Net& network) : Model(network) {}
 
 void SegmentationModel::segment(InputArray frame, OutputArray mask)
 {
     std::vector<Mat> outs;
     impl->processFrame(frame, outs);
-    CV_Assert(outs.size() == 1);
+    // default output is the first one
+    if(outs.size() > 1)
+        outs.resize(1);
     Mat score = outs[0];
 
     const int chns = score.size[1];
@@ -552,6 +656,9 @@ struct TextRecognitionModel_Impl : public Model::Impl
     std::string decodeType;
     std::vector<std::string> vocabulary;
 
+    int beamSize = 10;
+    int vocPruneSize = 0;
+
     TextRecognitionModel_Impl()
     {
         CV_TRACE_FUNCTION();
@@ -575,6 +682,13 @@ struct TextRecognitionModel_Impl : public Model::Impl
         decodeType = type;
     }
 
+    inline
+    void setDecodeOptsCTCPrefixBeamSearch(int beam, int vocPrune)
+    {
+        beamSize = beam;
+        vocPruneSize = vocPrune;
+    }
+
     virtual
     std::string decode(const Mat& prediction)
     {
@@ -586,44 +700,10 @@ struct TextRecognitionModel_Impl : public Model::Impl
             CV_Error(Error::StsBadArg, "TextRecognitionModel: vocabulary is not specified");
 
         std::string decodeSeq;
-        if (decodeType == "CTC-greedy")
-        {
-            CV_CheckEQ(prediction.dims, 3, "");
-            CV_CheckType(prediction.type(), CV_32FC1, "");
-            const int vocLength = (int)(vocabulary.size());
-            CV_CheckLE(prediction.size[1], vocLength, "");
-            bool ctcFlag = true;
-            int lastLoc = 0;
-            for (int i = 0; i < prediction.size[0]; i++)
-            {
-                const float* pred = prediction.ptr<float>(i);
-                int maxLoc = 0;
-                float maxScore = pred[0];
-                for (int j = 1; j < vocLength + 1; j++)
-                {
-                    float score = pred[j];
-                    if (maxScore < score)
-                    {
-                        maxScore = score;
-                        maxLoc = j;
-                    }
-                }
-
-                if (maxLoc > 0)
-                {
-                    std::string currentChar = vocabulary.at(maxLoc - 1);
-                    if (maxLoc != lastLoc || ctcFlag)
-                    {
-                        lastLoc = maxLoc;
-                        decodeSeq += currentChar;
-                        ctcFlag = false;
-                    }
-                }
-                else
-                {
-                    ctcFlag = true;
-                }
-            }
+        if (decodeType == "CTC-greedy") {
+            decodeSeq = ctcGreedyDecode(prediction);
+        } else if (decodeType == "CTC-prefix-beam-search") {
+            decodeSeq = ctcPrefixBeamSearchDecode(prediction);
         } else if (decodeType.length() == 0) {
             CV_Error(Error::StsBadArg, "Please set decodeType");
         } else {
@@ -631,6 +711,200 @@ struct TextRecognitionModel_Impl : public Model::Impl
         }
 
         return decodeSeq;
+    }
+
+    virtual
+    std::string ctcGreedyDecode(const Mat& prediction)
+    {
+        std::string decodeSeq;
+        CV_CheckEQ(prediction.dims, 3, "");
+        CV_CheckType(prediction.type(), CV_32FC1, "");
+        const int vocLength = (int)(vocabulary.size());
+        CV_CheckLE(prediction.size[1], vocLength, "");
+        bool ctcFlag = true;
+        int lastLoc = 0;
+        for (int i = 0; i < prediction.size[0]; i++)
+        {
+            const float* pred = prediction.ptr<float>(i);
+            int maxLoc = 0;
+            float maxScore = pred[0];
+            for (int j = 1; j < vocLength + 1; j++)
+            {
+                float score = pred[j];
+                if (maxScore < score)
+                {
+                    maxScore = score;
+                    maxLoc = j;
+                }
+            }
+
+            if (maxLoc > 0)
+            {
+                std::string currentChar = vocabulary.at(maxLoc - 1);
+                if (maxLoc != lastLoc || ctcFlag)
+                {
+                    lastLoc = maxLoc;
+                    decodeSeq += currentChar;
+                    ctcFlag = false;
+                }
+            }
+            else
+            {
+                ctcFlag = true;
+            }
+        }
+        return decodeSeq;
+    }
+
+    struct PrefixScore
+    {
+        // blank ending score
+        float pB;
+        // none blank ending score
+        float pNB;
+
+        PrefixScore() : pB(kNegativeInfinity), pNB(kNegativeInfinity)
+        {
+
+        }
+        PrefixScore(float pB, float pNB) : pB(pB), pNB(pNB)
+        {
+
+        }
+    };
+
+    struct PrefixHash
+    {
+        size_t operator()(const std::vector<int>& prefix) const
+        {
+              // BKDR hash
+              unsigned int seed = 131;
+              size_t hash = 0;
+              for (size_t i = 0; i < prefix.size(); i++)
+              {
+                  hash = hash * seed + prefix[i];
+              }
+              return hash;
+        }
+    };
+
+    static
+    std::vector<std::pair<float, int>> TopK(
+                      const float* predictions, int length, int k)
+    {
+        std::vector<std::pair<float, int>> results;
+        // No prune.
+        if (k <= 0)
+        {
+            for (int i = 0; i < length; ++i)
+            {
+                results.emplace_back(predictions[i], i);
+            }
+            return results;
+        }
+
+        for (int i = 0; i < k; ++i)
+        {
+            results.emplace_back(predictions[i], i);
+        }
+        std::make_heap(results.begin(), results.end(), std::greater<std::pair<float, int>>{});
+
+        for (int i = k; i < length; ++i)
+        {
+            if (predictions[i] > results.front().first)
+            {
+                std::pop_heap(results.begin(), results.end(), std::greater<std::pair<float, int>>{});
+                results.pop_back();
+                results.emplace_back(predictions[i], i);
+                std::push_heap(results.begin(), results.end(), std::greater<std::pair<float, int>>{});
+            }
+        }
+        return results;
+    }
+
+    static inline
+    bool PrefixScoreCompare(
+            const std::pair<std::vector<int>, PrefixScore>& a,
+            const std::pair<std::vector<int>, PrefixScore>& b)
+    {
+            float probA = LogAdd(a.second.pB, a.second.pNB);
+            float probB = LogAdd(b.second.pB, b.second.pNB);
+            return probA > probB;
+    }
+
+    virtual
+    std::string ctcPrefixBeamSearchDecode(const Mat& prediction) {
+          // CTC prefix beam search decode.
+          // For more detail, refer to:
+          // https://distill.pub/2017/ctc/#inference
+          // https://gist.github.com/awni/56369a90d03953e370f3964c826ed4b0i
+          using Beam = std::vector<std::pair<std::vector<int>, PrefixScore>>;
+          using BeamInDict = std::unordered_map<std::vector<int>, PrefixScore, PrefixHash>;
+
+          CV_CheckType(prediction.type(), CV_32FC1, "");
+          CV_CheckEQ(prediction.dims, 3, "");
+          CV_CheckEQ(prediction.size[1], 1, "");
+          CV_CheckEQ(prediction.size[2], (int)vocabulary.size() + 1, "");  // Length add 1 for ctc blank
+
+          std::string decodeSeq;
+          Beam beam = {std::make_pair(std::vector<int>(), PrefixScore(0.0, kNegativeInfinity))};
+          for (int i = 0; i < prediction.size[0]; i++)
+          {
+              // Loop over time
+              BeamInDict nextBeam;
+              const float* pred = prediction.ptr<float>(i);
+              std::vector<std::pair<float, int>> topkPreds =
+                  TopK(pred, vocabulary.size() + 1, vocPruneSize);
+              for (const auto& each : topkPreds)
+              {
+                  // Loop over vocabulary
+                  float prob = each.first;
+                  int token = each.second;
+                  for (const auto& it : beam)
+                  {
+                      const std::vector<int>& prefix = it.first;
+                      const PrefixScore& prefixScore = it.second;
+                      if (token == 0)  // 0 stands for ctc blank
+                      {
+                          PrefixScore& nextScore = nextBeam[prefix];
+                          nextScore.pB = LogAdd(nextScore.pB,
+                              LogAdd(prefixScore.pB + prob, prefixScore.pNB + prob));
+                          continue;
+                      }
+
+                      std::vector<int> nPrefix(prefix);
+                      nPrefix.push_back(token);
+                      PrefixScore& nextScore = nextBeam[nPrefix];
+                      if (prefix.size() > 0 && token == prefix.back())
+                      {
+                          nextScore.pNB = LogAdd(nextScore.pNB, prefixScore.pB + prob);
+                          PrefixScore& mScore = nextBeam[prefix];
+                          mScore.pNB = LogAdd(mScore.pNB, prefixScore.pNB + prob);
+                      }
+                      else
+                      {
+                          nextScore.pNB = LogAdd(nextScore.pNB,
+                              LogAdd(prefixScore.pB + prob, prefixScore.pNB + prob));
+                      }
+                  }
+              }
+              // Beam prune
+              Beam newBeam(nextBeam.begin(), nextBeam.end());
+              int newBeamSize = std::min(static_cast<int>(newBeam.size()), beamSize);
+              std::nth_element(newBeam.begin(), newBeam.begin() + newBeamSize,
+                     newBeam.end(), PrefixScoreCompare);
+              newBeam.resize(newBeamSize);
+              std::sort(newBeam.begin(), newBeam.end(), PrefixScoreCompare);
+              beam = std::move(newBeam);
+          }
+
+          CV_Assert(!beam.empty());
+          for (int token : beam[0].first)
+          {
+              CV_Check(token, token > 0 && token <= vocabulary.size(), "");
+              decodeSeq += vocabulary.at(token - 1);
+          }
+          return decodeSeq;
     }
 
     virtual
@@ -696,6 +970,12 @@ TextRecognitionModel& TextRecognitionModel::setDecodeType(const std::string& dec
 const std::string& TextRecognitionModel::getDecodeType() const
 {
     return TextRecognitionModel_Impl::from(impl).decodeType;
+}
+
+TextRecognitionModel& TextRecognitionModel::setDecodeOptsCTCPrefixBeamSearch(int beamSize, int vocPruneSize)
+{
+    TextRecognitionModel_Impl::from(impl).setDecodeOptsCTCPrefixBeamSearch(beamSize, vocPruneSize);
+    return *this;
 }
 
 TextRecognitionModel& TextRecognitionModel::setVocabulary(const std::vector<std::string>& inputVoc)
@@ -1113,7 +1393,7 @@ struct TextDetectionModel_DB_Impl : public TextDetectionModel_Impl
     {
         CV_TRACE_FUNCTION();
         std::vector< std::vector<Point2f> > results;
-
+        confidences.clear();
         std::vector<Mat> outs;
         processFrame(frame, outs);
         CV_Assert(outs.size() == 1);
@@ -1140,7 +1420,8 @@ struct TextDetectionModel_DB_Impl : public TextDetectionModel_Impl
             std::vector<Point>& contour = contours[i];
 
             // Calculate text contour score
-            if (contourScore(binary, contour) < polygonThreshold)
+            float score = contourScore(binary, contour);
+            if (score < polygonThreshold)
                 continue;
 
             // Rescale
@@ -1153,6 +1434,11 @@ struct TextDetectionModel_DB_Impl : public TextDetectionModel_Impl
 
             // Unclip
             RotatedRect box = minAreaRect(contourScaled);
+            float minLen = std::min(box.size.height/scaleWidth, box.size.width/scaleHeight);
+
+            // Filter very small boxes
+            if (minLen < 3)
+                continue;
 
             // minArea() rect is not normalized, it may return rectangles with angle=-90 or height < width
             const float angle_threshold = 60;  // do not expect vertical text, TODO detection algo property
@@ -1177,10 +1463,12 @@ struct TextDetectionModel_DB_Impl : public TextDetectionModel_Impl
                 approx.emplace_back(vertex[j]);
             std::vector<Point2f> polygon;
             unclip(approx, polygon, unclipRatio);
+            if (polygon.empty())
+                continue;
             results.push_back(polygon);
+            confidences.push_back(score);
         }
 
-        confidences = std::vector<float>(contours.size(), 1.0f);
         return results;
     }
 
@@ -1213,7 +1501,10 @@ struct TextDetectionModel_DB_Impl : public TextDetectionModel_Impl
     {
         double area = contourArea(inPoly);
         double length = arcLength(inPoly, true);
-        CV_Assert(length > FLT_EPSILON);
+
+        if(length == 0.)
+            return;
+
         double distance = area * unclipRatio / length;
 
         size_t numPoints = inPoly.size();
@@ -1322,4 +1613,4 @@ int TextDetectionModel_DB::getMaxCandidates() const
 }
 
 
-}} // namespace
+}}  // namespace

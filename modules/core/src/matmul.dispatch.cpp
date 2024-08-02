@@ -42,8 +42,10 @@
 //M*/
 
 #include "precomp.hpp"
+#include <opencv2/core/utils/logger.hpp>
+
 #include "opencl_kernels_core.hpp"
-#include "opencv2/core/opencl/runtime/opencl_clamdblas.hpp"
+#include "opencv2/core/opencl/runtime/opencl_clblas.hpp"
 #include "opencv2/core/opencl/runtime/opencl_core.hpp"
 #include "intel_gpu_gemm.inl.hpp"
 
@@ -106,47 +108,47 @@ static bool ocl_gemm_amdblas( InputArray matA, InputArray matB, double alpha,
     int offa = (int)A.offset / esz, offb = (int)B.offset / esz, offc = (int)D.offset / esz;
 
     cl_command_queue clq = (cl_command_queue)ocl::Queue::getDefault().ptr();
-    clAmdBlasTranspose transA = atrans ? clAmdBlasTrans : clAmdBlasNoTrans;
-    clAmdBlasTranspose transB = btrans ? clAmdBlasTrans : clAmdBlasNoTrans;
-    clAmdBlasOrder order = clAmdBlasRowMajor;
-    clAmdBlasStatus status = clAmdBlasSuccess;
+    clblasTranspose transA = atrans ? clblasTrans : clblasNoTrans;
+    clblasTranspose transB = btrans ? clblasTrans : clblasNoTrans;
+    clblasOrder order = clblasRowMajor;
+    clblasStatus status = clblasSuccess;
 
     if (type == CV_32FC1)
-        status = clAmdBlasSgemmEx(order, transA, transB, M, N, K,
-                                  (cl_float)alpha, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
-                                  (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
-                                  (cl_float)beta, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
-                                  1, &clq, 0, NULL, NULL);
+        status = clblasSgemm(order, transA, transB, M, N, K,
+                             (cl_float)alpha, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
+                             (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
+                             (cl_float)beta, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
+                             1, &clq, 0, NULL, NULL);
     else if (type == CV_64FC1)
-        status = clAmdBlasDgemmEx(order, transA, transB, M, N, K,
-                                  alpha, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
-                                  (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
-                                  beta, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
-                                  1, &clq, 0, NULL, NULL);
+        status = clblasDgemm(order, transA, transB, M, N, K,
+                             alpha, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
+                             (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
+                             beta, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
+                             1, &clq, 0, NULL, NULL);
     else if (type == CV_32FC2)
     {
          cl_float2 alpha_2 = { { (cl_float)alpha, 0 } };
          cl_float2 beta_2  = { { (cl_float)beta, 0 } };
-         status = clAmdBlasCgemmEx(order, transA, transB, M, N, K,
-                                   alpha_2, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
-                                   (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
-                                   beta_2, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
-                                   1, &clq, 0, NULL, NULL);
+         status = clblasCgemm(order, transA, transB, M, N, K,
+                              alpha_2, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
+                              (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
+                              beta_2, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
+                              1, &clq, 0, NULL, NULL);
     }
     else if (type == CV_64FC2)
     {
         cl_double2 alpha_2 = { { alpha, 0 } };
         cl_double2 beta_2  = { { beta, 0 } };
-        status = clAmdBlasZgemmEx(order, transA, transB, M, N, K,
-                                  alpha_2, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
-                                  (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
-                                  beta_2, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
-                                  1, &clq, 0, NULL, NULL);
+        status = clblasZgemm(order, transA, transB, M, N, K,
+                             alpha_2, (const cl_mem)A.handle(ACCESS_READ), offa, lda,
+                             (const cl_mem)B.handle(ACCESS_READ), offb, ldb,
+                             beta_2, (cl_mem)D.handle(ACCESS_RW), offc, ldc,
+                             1, &clq, 0, NULL, NULL);
     }
     else
         CV_Error(Error::StsUnsupportedFormat, "");
 
-    return status == clAmdBlasSuccess;
+    return status == clblasSuccess;
 }
 
 #endif
@@ -155,10 +157,12 @@ static bool ocl_gemm_amdblas( InputArray matA, InputArray matB, double alpha,
 static bool ocl_gemm( InputArray matA, InputArray matB, double alpha,
                       InputArray matC, double beta, OutputArray matD, int flags )
 {
-    int depth = matA.depth(), cn = matA.channels();
-    int type = CV_MAKETYPE(depth, cn);
+    int type = matA.type();
+    int depth = CV_MAT_DEPTH(type);
+    int cn = CV_MAT_CN(type);
 
-    CV_Assert_N( type == matB.type(), (type == CV_32FC1 || type == CV_64FC1 || type == CV_32FC2 || type == CV_64FC2) );
+    CV_CheckTypeEQ(type, matB.type(), "");
+    CV_CheckType(type, type == CV_32FC1 || type == CV_64FC1 || type == CV_32FC2 || type == CV_64FC2, "");
 
     const ocl::Device & dev = ocl::Device::getDefault();
     bool doubleSupport = dev.doubleFPConfig() > 0;
@@ -170,88 +174,103 @@ static bool ocl_gemm( InputArray matA, InputArray matB, double alpha,
     Size sizeA = matA.size(), sizeB = matB.size(), sizeC = haveC ? matC.size() : Size(0, 0);
     bool atrans = (flags & GEMM_1_T) != 0, btrans = (flags & GEMM_2_T) != 0, ctrans = (flags & GEMM_3_T) != 0;
 
-    CV_Assert( !haveC || matC.type() == type );
+    if (haveC)
+        CV_CheckTypeEQ(type, matC.type(), "");
 
-    Size sizeD(((btrans)? sizeB.height : sizeB.width),
-               ((atrans)? sizeA.width : sizeA.height));
+    Size sizeD(((btrans) ? sizeB.height : sizeB.width),
+               ((atrans) ? sizeA.width : sizeA.height));
+
+    if (atrans)
+        sizeA = Size(sizeA.height, sizeA.width);
+    if (btrans)
+        sizeB = Size(sizeB.height, sizeB.width);
+    if (haveC && ctrans)
+        sizeC = Size(sizeC.height, sizeC.width);
+
+    CV_CheckEQ(sizeA.width, sizeB.height, "");
+    if (haveC)
+        CV_CheckEQ(sizeC, sizeD, "");
+
+    UMat A = matA.getUMat();
+    UMat B = matB.getUMat();
+
     matD.create(sizeD, type);
+    UMat D = matD.getUMat();
 
-    UMat A = matA.getUMat(), B = matB.getUMat(), D = matD.getUMat();
+    bool isPropagatedC2D = false;  // D content is updated with C / C.t()
 
-
-    if (!dev.intelSubgroupsSupport() || (depth == CV_64F) || cn != 1)
-    {
-        String opts;
-
-        if (atrans)
-            sizeA = Size(sizeA.height, sizeA.width);
-        if (btrans)
-            sizeB = Size(sizeB.height, sizeB.width);
-        if (haveC && ctrans)
-            sizeC = Size(sizeC.height, sizeC.width);
-
-        CV_Assert( sizeA.width == sizeB.height && (!haveC || sizeC == sizeD) );
-
-        int max_wg_size = (int)dev.maxWorkGroupSize();
-        int block_size = (max_wg_size / (32*cn) < 32) ? (max_wg_size / (16*cn) < 16) ? (max_wg_size / (8*cn) < 8) ? 1 : 8 : 16 : 32;
-
-        if (atrans)
-            A = A.t();
-
-        if (btrans)
-            B = B.t();
-
-        if (haveC)
-            ctrans ? transpose(matC, D) : matC.copyTo(D);
-
-        int vectorWidths[] = { 4, 4, 2, 2, 1, 4, cn, -1 };
-        int kercn = ocl::checkOptimalVectorWidth(vectorWidths, B, D);
-
-        opts += format(" -D T=%s -D T1=%s -D WT=%s -D cn=%d -D kercn=%d -D LOCAL_SIZE=%d%s%s%s",
-                          ocl::typeToStr(type), ocl::typeToStr(depth), ocl::typeToStr(CV_MAKETYPE(depth, kercn)),
-                          cn, kercn, block_size,
-                          (sizeA.width % block_size !=0) ? " -D NO_MULT" : "",
-                          haveC ? " -D HAVE_C" : "",
-                          doubleSupport ? " -D DOUBLE_SUPPORT" : "");
-
-        ocl::Kernel k("gemm", cv::ocl::core::gemm_oclsrc, opts);
-        if (k.empty())
-            return false;
-
-        if (depth == CV_64F)
-            k.args(ocl::KernelArg::ReadOnlyNoSize(A),
-                   ocl::KernelArg::ReadOnlyNoSize(B, cn, kercn),
-                   ocl::KernelArg::ReadWrite(D, cn, kercn),
-                   sizeA.width, alpha, beta);
-        else
-            k.args(ocl::KernelArg::ReadOnlyNoSize(A),
-                   ocl::KernelArg::ReadOnlyNoSize(B, cn, kercn),
-                   ocl::KernelArg::ReadWrite(D, cn, kercn),
-                   sizeA.width, (float)alpha, (float)beta);
-
-        size_t globalsize[2] = { (size_t)sizeD.width * cn / kercn, (size_t)sizeD.height};
-        size_t localsize[2] = { (size_t)block_size, (size_t)block_size};
-
-        return k.run(2, globalsize, block_size!=1 ? localsize : NULL, false);
-    }
-    else
+    if (dev.intelSubgroupsSupport() && (depth == CV_32F) && cn == 1)
     {
         if (haveC && beta != 0.0)
         {
             ctrans ? transpose(matC, D) : matC.copyTo(D);
+            isPropagatedC2D = true;
         }
         else
         {
             beta = 0.0;
         }
 
-        return intel_gpu_gemm(A, sizeA,
-                              B, sizeB,
-                              D, sizeD,
-                              alpha,
-                              beta,
-                              atrans, btrans);
+        bool res = intel_gpu_gemm(A, matA.size(),
+                                  B, matB.size(),
+                                  D, sizeD,
+                                  alpha,
+                                  beta,
+                                  atrans, btrans,
+                                  isPropagatedC2D);
+        if (res)
+            return true;
+        // fallback on generic OpenCL code
     }
+
+    if (sizeD.width < 8 || sizeD.height < 8)
+        return false;
+
+    String opts;
+
+    int wg_size = (int)dev.maxWorkGroupSize();
+    int sizeDmin = std::min(sizeD.width, sizeD.height);
+    wg_size = std::min(wg_size, sizeDmin * sizeDmin);
+    int block_size = (wg_size / (32*cn) < 32) ? (wg_size / (16*cn) < 16) ? (wg_size / (8*cn) < 8) ? 1 : 8 : 16 : 32;
+
+    if (atrans)
+        A = A.t();
+
+    if (btrans)
+        B = B.t();
+
+    if (haveC && !isPropagatedC2D)
+        ctrans ? transpose(matC, D) : matC.copyTo(D);
+
+    int vectorWidths[] = { 4, 4, 2, 2, 1, 4, cn, -1 };
+    int kercn = ocl::checkOptimalVectorWidth(vectorWidths, B, D);
+
+    opts += format(" -D T=%s -D T1=%s -D WT=%s -D cn=%d -D kercn=%d -D LOCAL_SIZE=%d%s%s%s",
+                      ocl::typeToStr(type), ocl::typeToStr(depth), ocl::typeToStr(CV_MAKETYPE(depth, kercn)),
+                      cn, kercn, block_size,
+                      (sizeA.width % block_size !=0) ? " -D NO_MULT" : "",
+                      haveC ? " -D HAVE_C" : "",
+                      doubleSupport ? " -D DOUBLE_SUPPORT" : "");
+
+    ocl::Kernel k("gemm", cv::ocl::core::gemm_oclsrc, opts);
+    if (k.empty())
+        return false;
+
+    if (depth == CV_64F)
+        k.args(ocl::KernelArg::ReadOnlyNoSize(A),
+               ocl::KernelArg::ReadOnlyNoSize(B, cn, kercn),
+               ocl::KernelArg::ReadWrite(D, cn, kercn),
+               sizeA.width, alpha, beta);
+    else
+        k.args(ocl::KernelArg::ReadOnlyNoSize(A),
+               ocl::KernelArg::ReadOnlyNoSize(B, cn, kercn),
+               ocl::KernelArg::ReadWrite(D, cn, kercn),
+               sizeA.width, (float)alpha, (float)beta);
+
+    size_t globalsize[2] = { (size_t)sizeD.width * cn / kercn, (size_t)sizeD.height};
+    size_t localsize[2] = { (size_t)block_size, (size_t)block_size};
+
+    return k.run(2, globalsize, block_size !=1 ? localsize : NULL, false);
 }
 #endif
 
@@ -587,8 +606,8 @@ static bool ocl_scaleAdd( InputArray _src1, double alpha, InputArray _src2, Outp
                          " -D wdepth=%d%s -D rowsPerWI=%d",
                          ocl::typeToStr(CV_MAKE_TYPE(depth, kercn)), depth,
                          ocl::typeToStr(CV_MAKE_TYPE(wdepth, kercn)),
-                         ocl::convertTypeStr(depth, wdepth, kercn, cvt[0]),
-                         ocl::convertTypeStr(wdepth, depth, kercn, cvt[1]),
+                         ocl::convertTypeStr(depth, wdepth, kercn, cvt[0], sizeof(cvt[0])),
+                         ocl::convertTypeStr(wdepth, depth, kercn, cvt[1], sizeof(cvt[1])),
                          ocl::typeToStr(wdepth), wdepth,
                          doubleSupport ? " -D DOUBLE_SUPPORT" : "", rowsPerWI));
     if (k.empty())
@@ -785,7 +804,7 @@ void calcCovarMatrix( InputArray _src, OutputArray _covar, InputOutputArray _mea
     else
     {
         ctype = std::max(CV_MAT_DEPTH(ctype >= 0 ? ctype : type), CV_32F);
-        reduce( _src, _mean, takeRows ? 0 : 1, CV_REDUCE_AVG, ctype );
+        reduce( _src, _mean, takeRows ? 0 : 1, REDUCE_AVG, ctype );
         mean = _mean.getMat();
     }
 
@@ -902,7 +921,7 @@ void mulTransposed(InputArray _src, OutputArray _dst, bool ata,
     {
         MulTransposedFunc func = getMulTransposedFunc(stype, dtype, ata);
         if( !func )
-            CV_Error( CV_StsUnsupportedFormat, "" );
+            CV_Error( cv::Error::StsUnsupportedFormat, "" );
 
         func( src, dst, delta, scale );
         completeSymm( dst, false );
@@ -960,7 +979,7 @@ typedef double (*DotProdFunc)(const uchar* src1, const uchar* src2, int len);
 
 static DotProdFunc getDotProdFunc(int depth)
 {
-    static DotProdFunc dotProdTab[] =
+    static DotProdFunc dotProdTab[CV_DEPTH_MAX] =
     {
         (DotProdFunc)GET_OPTIMIZED(dotProd_8u), (DotProdFunc)GET_OPTIMIZED(dotProd_8s),
         (DotProdFunc)dotProd_16u, (DotProdFunc)dotProd_16s,
@@ -976,9 +995,18 @@ double Mat::dot(InputArray _mat) const
     CV_INSTRUMENT_REGION();
 
     Mat mat = _mat.getMat();
+    CV_Assert_N( mat.type() == type(), mat.size == size);
+
     int cn = channels();
+    if (this->dims <= 2)
+    {
+        double product = 0;
+        CALL_HAL_RET(dotProduct, cv_hal_dotProduct, product, this->data, this->step, mat.data, mat.step,
+                     this->cols * cn, this->rows, this->depth());
+    }
+
     DotProdFunc func = getDotProdFunc(depth());
-    CV_Assert_N( mat.type() == type(), mat.size == size, func != 0 );
+    CV_Assert(func != 0 );
 
     if( isContinuous() && mat.isContinuous() )
     {
@@ -1022,13 +1050,13 @@ static bool ocl_dot( InputArray _src1, InputArray _src2, double & res )
         wgs2_aligned <<= 1;
     wgs2_aligned >>= 1;
 
-    char cvt[40];
+    char cvt[50];
     ocl::Kernel k("reduce", ocl::core::reduce_oclsrc,
                   format("-D srcT=%s -D srcT1=%s -D dstT=%s -D dstTK=%s -D ddepth=%d -D convertToDT=%s -D OP_DOT "
                          "-D WGS=%d -D WGS2_ALIGNED=%d%s%s%s -D kercn=%d",
                          ocl::typeToStr(CV_MAKE_TYPE(depth, kercn)), ocl::typeToStr(depth),
                          ocl::typeToStr(ddepth), ocl::typeToStr(CV_MAKE_TYPE(ddepth, kercn)),
-                         ddepth, ocl::convertTypeStr(depth, ddepth, kercn, cvt),
+                         ddepth, ocl::convertTypeStr(depth, ddepth, kercn, cvt, sizeof(cvt)),
                          (int)wgs, wgs2_aligned, doubleSupport ? " -D DOUBLE_SUPPORT" : "",
                          _src1.isContinuous() ? " -D HAVE_SRC_CONT" : "",
                          _src2.isContinuous() ? " -D HAVE_SRC2_CONT" : "", kercn));

@@ -258,6 +258,8 @@ class ClassInfo(GeneralInfo):
         for m in decl[2]:
             if m.startswith("="):
                 self.jname = m[1:]
+            if m == '/Simple':
+                self.smart = False
 
         if self.classpath:
             prefix = self.classpath.replace('.', '_')
@@ -445,7 +447,7 @@ class JavaWrapperGenerator(object):
 
     def clear(self):
         self.namespaces = ["cv"]
-        classinfo_Mat = ClassInfo([ 'class cv.Mat', '', [], [] ], self.namespaces)
+        classinfo_Mat = ClassInfo([ 'class cv.Mat', '', ['/Simple'], [] ], self.namespaces)
         self.classes = { "Mat" : classinfo_Mat }
         self.module = ""
         self.Module = ""
@@ -466,10 +468,15 @@ class JavaWrapperGenerator(object):
         if name in type_dict and not classinfo.base:
             logging.warning('duplicated: %s', classinfo)
             return
+        if self.isSmartClass(classinfo):
+            jni_name = "*((*(Ptr<"+classinfo.fullNameCPP()+">*)%(n)s_nativeObj).get())"
+        else:
+            jni_name = "(*("+classinfo.fullNameCPP()+"*)%(n)s_nativeObj)"
         type_dict.setdefault(name, {}).update(
             { "j_type" : classinfo.jname,
               "jn_type" : "long", "jn_args" : (("__int64", ".nativeObj"),),
-              "jni_name" : "(*("+classinfo.fullNameCPP()+"*)%(n)s_nativeObj)", "jni_type" : "jlong",
+              "jni_name" : jni_name,
+              "jni_type" : "jlong",
               "suffix" : "J",
               "j_import" : "org.opencv.%s.%s" % (self.module, classinfo.jname)
             }
@@ -477,7 +484,8 @@ class JavaWrapperGenerator(object):
         type_dict.setdefault(name+'*', {}).update(
             { "j_type" : classinfo.jname,
               "jn_type" : "long", "jn_args" : (("__int64", ".nativeObj"),),
-              "jni_name" : "("+classinfo.fullNameCPP()+"*)%(n)s_nativeObj", "jni_type" : "jlong",
+              "jni_name" : "&("+jni_name+")",
+              "jni_type" : "jlong",
               "suffix" : "J",
               "j_import" : "org.opencv.%s.%s" % (self.module, classinfo.jname)
             }
@@ -678,7 +686,7 @@ class JavaWrapperGenerator(object):
             msg = "// Return type '%s' is not supported, skipping the function\n\n" % fi.ctype
             self.skipped_func_list.append(c_decl + "\n" + msg)
             j_code.write( " "*4 + msg )
-            logging.warning("SKIP:" + c_decl.strip() + "\t due to RET type " + fi.ctype)
+            logging.info("SKIP:" + c_decl.strip() + "\t due to RET type " + fi.ctype)
             return
         for a in fi.args:
             if a.ctype not in type_dict:
@@ -690,7 +698,7 @@ class JavaWrapperGenerator(object):
                 msg = "// Unknown type '%s' (%s), skipping the function\n\n" % (a.ctype, a.out or "I")
                 self.skipped_func_list.append(c_decl + "\n" + msg)
                 j_code.write( " "*4 + msg )
-                logging.warning("SKIP:" + c_decl.strip() + "\t due to ARG type " + a.ctype + "/" + (a.out or "I"))
+                logging.info("SKIP:" + c_decl.strip() + "\t due to ARG type " + a.ctype + "/" + (a.out or "I"))
                 return
 
         self.ported_func_list.append(c_decl)
@@ -966,7 +974,13 @@ class JavaWrapperGenerator(object):
                 ret = "return env->NewStringUTF(_retval_.c_str());"
                 default = 'return env->NewStringUTF("");'
             elif self.isWrapped(fi.ctype): # wrapped class:
-                ret = "return (jlong) new %s(_retval_);" % self.fullTypeNameCPP(fi.ctype)
+                ret = None
+                if fi.ctype in self.classes:
+                    ret_ci = self.classes[fi.ctype]
+                    if self.isSmartClass(ret_ci):
+                        ret = "return (jlong)(new Ptr<%(ctype)s>(new %(ctype)s(_retval_)));" % { 'ctype': ret_ci.fullNameCPP() }
+                if ret is None:
+                    ret = "return (jlong) new %s(_retval_);" % self.fullTypeNameCPP(fi.ctype)
             elif fi.ctype.startswith('Ptr_'):
                 c_prologue.append("typedef Ptr<%s> %s;" % (self.fullTypeNameCPP(fi.ctype[4:]), fi.ctype))
                 ret = "return (jlong)(new %(ctype)s(_retval_));" % { 'ctype':fi.ctype }
@@ -1207,17 +1221,7 @@ JNIEXPORT void JNICALL Java_org_opencv_%(module)s_%(j_cls)s_delete
         if ci.smart != None:
             return ci.smart
 
-        # if parents are smart (we hope) then children are!
-        # if not we believe the class is smart if it has "create" method
-        ci.smart = False
-        if ci.base or ci.name == 'Algorithm':
-            ci.smart = True
-        else:
-            for fi in ci.methods:
-                if fi.name == "create":
-                    ci.smart = True
-                    break
-
+        ci.smart = True  # smart class is not properly handled in case of base/derived classes
         return ci.smart
 
     def smartWrap(self, ci, fullname):
@@ -1236,13 +1240,13 @@ JNIEXPORT void JNICALL Java_org_opencv_%(module)s_%(j_cls)s_delete
 def copy_java_files(java_files_dir, java_base_path, default_package_path='org/opencv/'):
     global total_files, updated_files
     java_files = []
-    re_filter = re.compile(r'^.+\.(java|aidl)(.in)?$')
+    re_filter = re.compile(r'^.+\.(java|kt)(.in)?$')
     for root, dirnames, filenames in os.walk(java_files_dir):
        java_files += [os.path.join(root, filename) for filename in filenames if re_filter.match(filename)]
     java_files = [f.replace('\\', '/') for f in java_files]
 
     re_package = re.compile(r'^package +(.+);')
-    re_prefix = re.compile(r'^.+[\+/]([^\+]+).(java|aidl)(.in)?$')
+    re_prefix = re.compile(r'^.+[\+/]([^\+]+).(java|kt)(.in)?$')
     for java_file in java_files:
         src = checkFileRemap(java_file)
         with open(src, 'r') as f:
@@ -1349,7 +1353,7 @@ def sanitize_java_documentation_string(doc, type):
                 indexDiff += 1
             lines[index + indexDiff] = lines[index + indexDiff][0:i] + lines[index + indexDiff][i + 1:]
         else:
-            if listInd and (not line or line == "*" or line.startswith("@note")):
+            if listInd and (not line or line == "*" or line.strip().startswith("@note") or line.strip().startswith("@param")):
                 lines.insert(index + indexDiff, "  "*len(listInd) + "</li>")
                 indexDiff += 1
                 del listInd[-1]
@@ -1415,7 +1419,8 @@ if __name__ == "__main__":
     java_base_path = os.path.join(dstdir, 'java'); mkdir_p(java_base_path)
     java_test_base_path = os.path.join(dstdir, 'test'); mkdir_p(java_test_base_path)
 
-    for (subdir, target_subdir) in [('src/java', 'java'), ('android/java', None), ('android-21/java', None)]:
+    for (subdir, target_subdir) in [('src/java', 'java'), ('android/java', None),
+                                    ('android-21/java', None), ('android-24/java', None)]:
         if target_subdir is None:
             target_subdir = subdir
         java_files_dir = os.path.join(SCRIPT_DIR, subdir)

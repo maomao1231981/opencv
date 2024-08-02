@@ -309,7 +309,7 @@ public:
     {
         CV_TRACE_FUNCTION();
         if( roots.empty() )
-            CV_Error( CV_StsBadArg, "RTrees have not been trained" );
+            CV_Error( cv::Error::StsBadArg, "RTrees have not been trained" );
 
         writeFormat(fs);
         writeParams(fs);
@@ -480,6 +480,7 @@ public:
     float predict( InputArray samples, OutputArray results, int flags ) const CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
+        CV_CheckEQ(samples.cols(), getVarCount(), "");
         return impl.predict(samples, results, flags);
     }
 

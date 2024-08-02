@@ -2,7 +2,7 @@ OpenCV configuration options reference {#tutorial_config_reference}
 ======================================
 
 @prev_tutorial{tutorial_general_install}
-@next_tutorial{tutorial_linux_install}
+@next_tutorial{tutorial_env_reference}
 
 @tableofcontents
 
@@ -205,17 +205,19 @@ cmake -DCV_DISABLE_OPTIMIZATION=ON ../opencv
 More details on CPU optimization options can be found in wiki: https://github.com/opencv/opencv/wiki/CPU-optimizations-build-options
 
 
-## Profiling, coverage, sanitize, hardening, size optimization
+## Profiling, coverage, sanitize, hardening, size optimization {#profiling_coverage_sanitize_hardening_size_optimization}
 
 Following options can be used to produce special builds with instrumentation or improved security. All options are disabled by default.
 
 | Option | Compiler | Description |
+| -------| -------- | ----------- |
 | `ENABLE_PROFILING` | GCC or Clang | Enable profiling compiler and linker options. |
 | `ENABLE_COVERAGE` | GCC or Clang | Enable code coverage support. |
 | `OPENCV_ENABLE_MEMORY_SANITIZER` | N/A | Enable several quirks in code to assist memory sanitizer. |
 | `ENABLE_BUILD_HARDENING` | GCC, Clang, MSVC | Enable compiler options which reduce possibility of code exploitation.  |
 | `ENABLE_LTO` | GCC, Clang, MSVC | Enable Link Time Optimization (LTO). |
 | `ENABLE_THIN_LTO` | Clang | Enable thin LTO which incorporates intermediate bitcode to binaries allowing consumers optimize their applications later. |
+| `OPENCV_ALGO_HINT_DEFAULT` | Any | Set default OpenCV implementation hint value: `ALGO_HINT_ACCURATE` or `ALGO_HINT_APROX`. Dangerous! The option  changes behaviour globally and may affect accuracy of many algorithms. |
 
 @see [GCC instrumentation](https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html)
 @see [Build hardening](https://en.wikipedia.org/wiki/Hardening_(computing))
@@ -223,6 +225,16 @@ Following options can be used to produce special builds with instrumentation or 
 @see [Link time optimization](https://gcc.gnu.org/wiki/LinkTimeOptimization)
 @see [ThinLTO](https://clang.llvm.org/docs/ThinLTO.html)
 
+## Enable IPP optimization
+
+Following options can be used to enables IPP optimizations for each functions but increases the size of the opencv library. All options are disabled by default.
+
+| Option | Functions | + roughly size |
+| -------| --------- | -------------- |
+| `OPENCV_IPP_GAUSSIAN_BLUR` | GaussianBlur() | +8Mb |
+| `OPENCV_IPP_MEAN` | mean() / meanStdDev() | +0.2Mb |
+| `OPENCV_IPP_MINMAX` | minMaxLoc() / minMaxIdx() | +0.2Mb |
+| `OPENCV_IPP_SUM` | sum() | +0.1Mb |
 
 # Functional features and dependencies {#tutorial_config_reference_func}
 
@@ -339,7 +351,7 @@ Integration with [FFmpeg](https://en.wikipedia.org/wiki/FFmpeg) library for deco
 - _swscale_
 - _avresample_ (optional)
 
-Exception is Windows platform where a prebuilt [plugin library containing FFmpeg](https://github.com/opencv/opencv_3rdparty/tree/ffmpeg/master) will be downloaded during a configuration stage and copied to the `bin` folder with all produced libraries.
+Exception is Windows platform where a prebuilt [plugin library containing FFmpeg](https://github.com/opencv/opencv_3rdparty/tree/ffmpeg/4.x) will be downloaded during a configuration stage and copied to the `bin` folder with all produced libraries.
 
 @note [Libav](https://en.wikipedia.org/wiki/Libav) library can be used instead of FFmpeg, but this combination is not actively supported.
 
@@ -396,13 +408,14 @@ There are multiple less popular frameworks which can be used to read and write v
 
 ### videoio plugins
 
-Some _videoio_ backends can be built as plugins thus breaking strict dependency on third-party libraries and making them optional at runtime. Following options can be used to control this mechanism:
+Since version 4.1.0 some _videoio_ backends can be built as plugins thus breaking strict dependency on third-party libraries and making them optional at runtime. Following options can be used to control this mechanism:
 
 | Option | Default | Description |
 | --------| ------ | ------- |
 | `VIDEOIO_ENABLE_PLUGINS` | _ON_ | Enable or disable plugins completely. |
 | `VIDEOIO_PLUGIN_LIST` | _empty_ | Comma- or semicolon-separated list of backend names to be compiled as plugins. Supported names are _ffmpeg_, _gstreamer_, _msmf_, _mfx_ and _all_. |
-| `VIDEOIO_ENABLE_STRICT_PLUGIN_CHECK` | _ON_ | Enable strict runtime version check to only allow plugins built with the same version of OpenCV. |
+
+Check @ref tutorial_general_install for standalone plugins build instructions.
 
 
 ## Parallel processing {#tutorial_config_reference_func_core}
@@ -419,6 +432,17 @@ Some of OpenCV algorithms can use multithreading to accelerate processing. OpenC
 | HPX | `WITH_HPX` | _OFF_ | Multiple | [High Performance ParallelX](https://en.wikipedia.org/wiki/HPX) is an experimental backend which is more suitable for multiprocessor environments. |
 
 @note OpenCV can download and build TBB library from GitHub, this functionality can be enabled with the `BUILD_TBB` option.
+
+
+### Threading plugins
+
+Since version 4.5.2 OpenCV supports dynamically loaded threading backends. At this moment only separate compilation process is supported: first you have to build OpenCV with some _default_ parallel backend (e.g. pthreads), then build each plugin and copy resulting binaries to the _lib_ or _bin_ folder.
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| PARALLEL_ENABLE_PLUGINS | ON | Enable plugin support, if this option is disabled OpenCV will not try to load anything |
+
+Check @ref tutorial_general_install for standalone plugins build instructions.
 
 
 ## GUI backends (highgui module) {#tutorial_config_reference_highgui}
@@ -442,6 +466,18 @@ OpenCV relies on various GUI libraries for window drawing.
 OpenGL integration can be used to draw HW-accelerated windows with following backends: GTK, WIN32 and Qt. And enables basic interoperability with OpenGL, see @ref core_opengl and @ref highgui_opengl for details.
 
 
+### highgui plugins
+
+Since OpenCV 4.5.3 GTK backend can be build as a dynamically loaded plugin. Following options can be used to control this mechanism:
+
+| Option | Default | Description |
+| --------| ------ | ------- |
+| `HIGHGUI_ENABLE_PLUGINS` | _ON_ | Enable or disable plugins completely. |
+| `HIGHGUI_PLUGIN_LIST` | _empty_ | Comma- or semicolon-separated list of backend names to be compiled as plugins. Supported names are _gtk_, _gtk2_, _gtk3_, and _all_. |
+
+Check @ref tutorial_general_install for standalone plugins build instructions.
+
+
 ## Deep learning neural networks inference backends and options (dnn module) {#tutorial_config_reference_dnn}
 
 OpenCV have own DNN inference module which have own build-in engine, but can also use other libraries for optimized processing. Multiple backends can be enabled in single build. Selection happens at runtime automatically or manually.
@@ -452,13 +488,13 @@ OpenCV have own DNN inference module which have own build-in engine, but can als
 | `BUILD_PROTOBUF` | _ON_ | Build own copy of _protobuf_. Must be disabled if you want to use external library. |
 | `PROTOBUF_UPDATE_FILES` | _OFF_ | Re-generate all .proto files. _protoc_ compiler compatible with used version of _protobuf_ must be installed. |
 | `OPENCV_DNN_OPENCL` | _ON_ | Enable built-in OpenCL inference backend. |
-| `WITH_INF_ENGINE` | _OFF_ | Enables [Intel Inference Engine (IE)](https://github.com/openvinotoolkit/openvino) backend. Allows to execute networks in IE format (.xml + .bin). Inference Engine must be installed either as part of [OpenVINO toolkit](https://en.wikipedia.org/wiki/OpenVINO), either as a standalone library built from sources. |
-| `INF_ENGINE_RELEASE` | _2020040000_ | Defines version of Inference Engine library which is tied to OpenVINO toolkit version. Must be a 10-digit string, e.g. _2020040000_ for OpenVINO 2020.4. |
-| `WITH_NGRAPH` | _OFF_ | Enables Intel NGraph library support. This library is part of Inference Engine backend which allows executing arbitrary networks read from files in multiple formats supported by OpenCV: Caffe, TensorFlow, PyTorch, Darknet, etc.. NGraph library must be installed, it is included into Inference Engine. |
+| `WITH_INF_ENGINE` | _OFF_ | **Deprecated since OpenVINO 2022.1** Enables [Intel Inference Engine (IE)](https://github.com/openvinotoolkit/openvino) backend. Allows to execute networks in IE format (.xml + .bin). Inference Engine must be installed either as part of [OpenVINO toolkit](https://en.wikipedia.org/wiki/OpenVINO), either as a standalone library built from sources. |
+| `INF_ENGINE_RELEASE` | _2020040000_ | **Deprecated since OpenVINO 2022.1** Defines version of Inference Engine library which is tied to OpenVINO toolkit version. Must be a 10-digit string, e.g. _2020040000_ for OpenVINO 2020.4. |
+| `WITH_NGRAPH` | _OFF_ | **Deprecated since OpenVINO 2022.1** Enables Intel NGraph library support. This library is part of Inference Engine backend which allows executing arbitrary networks read from files in multiple formats supported by OpenCV: Caffe, TensorFlow, PyTorch, Darknet, etc.. NGraph library must be installed, it is included into Inference Engine. |
+| `WITH_OPENVINO` | _OFF_ | Enable Intel OpenVINO Toolkit support. Should be used for OpenVINO>=2022.1 instead of `WITH_INF_ENGINE` and `WITH_NGRAPH`. |
 | `OPENCV_DNN_CUDA` | _OFF_ | Enable CUDA backend. [CUDA](https://en.wikipedia.org/wiki/CUDA), CUBLAS and [CUDNN](https://developer.nvidia.com/cudnn) must be installed. |
 | `WITH_HALIDE` | _OFF_ | Use experimental [Halide](https://en.wikipedia.org/wiki/Halide_(programming_language)) backend which can generate optimized code for dnn-layers at runtime. Halide must be installed. |
 | `WITH_VULKAN` | _OFF_ | Enable experimental [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) backend. Does not require additional dependencies, but can use external Vulkan headers (`VULKAN_INCLUDE_DIRS`). |
-| `WITH_TENGINE` | _OFF_ | Enable experimental [Tengine](https://github.com/OAID/Tengine) backend for ARM CPUs. Tengine library must be installed. |
 
 
 # Installation layout {#tutorial_config_reference_install}
@@ -540,6 +576,7 @@ Following options can be used to change installation layout for common scenarios
 | ------ | ------- | ----------- |
 | `OPENCV_ENABLE_NONFREE` | _OFF_ | Some algorithms included in the library are known to be protected by patents and are disabled by default. |
 | `OPENCV_FORCE_3RDPARTY_BUILD`| _OFF_ | Enable all `BUILD_` options at once. |
+| `OPENCV_IPP_ENABLE_ALL`| _OFF_ | Enable all `OPENCV_IPP_` options at once. |
 | `ENABLE_CCACHE` | _ON_ (on Unix-like platforms) | Enable [ccache](https://en.wikipedia.org/wiki/Ccache) auto-detection. This tool wraps compiler calls and caches results, can significantly improve re-compilation time. |
 | `ENABLE_PRECOMPILED_HEADERS` | _ON_ (for MSVC) | Enable precompiled headers support. Improves build time. |
 | `BUILD_DOCS` | _OFF_ | Enable documentation build (_doxygen_, _doxygen_cpp_, _doxygen_python_, _doxygen_javadoc_ targets). [Doxygen](http://www.doxygen.org/index.html) must be installed for C++ documentation build. Python and [BeautifulSoup4](https://en.wikipedia.org/wiki/Beautiful_Soup_(HTML_parser)) must be installed for Python documentation build. Javadoc and Ant must be installed for Java documentation build (part of Java SDK). |
@@ -549,6 +586,7 @@ Following options can be used to change installation layout for common scenarios
 | `BUILD_FAT_JAVA_LIB` | _ON_ (for static Android builds) | Build single _opencv_java_ dynamic library containing all library functionality bundled with Java bindings. |
 | `BUILD_opencv_python2` | _ON_ | Build python2 bindings (deprecated). Python with development files and numpy must be installed. |
 | `BUILD_opencv_python3` | _ON_ | Build python3 bindings. Python with development files and numpy must be installed. |
+| `CAROTENE_NEON_ARCH` | '(auto)' | Switch NEON Arch for Carotene. If it sets nothing, it will be auto-detected. If it sets 8, ARMv8(and later) is used. Otherwise, ARMv7 is used. |
 
 TODO: need separate tutorials covering bindings builds
 
@@ -565,6 +603,14 @@ Some features have been added specifically for automated build environments, lik
 | `OPENCV_CMAKE_HOOKS_DIR` | _empty_ | OpenCV allows to customize configuration process by adding custom hook scripts at each stage and substage. cmake scripts with predefined names located in the directory set by this variable will be included before and after various configuration stages. Examples of file names: _CMAKE_INIT.cmake_, _PRE_CMAKE_BOOTSTRAP.cmake_, _POST_CMAKE_BOOTSTRAP.cmake_, etc.. Other names are not documented and can be found in the project cmake files by searching for the _ocv_cmake_hook_ macro calls. |
 | `OPENCV_DUMP_HOOKS_FLOW` | _OFF_ | Enables a debug message print on each cmake hook script call. |
 
+## Contrib Modules
+
+Following build options are utilized in `opencv_contrib` modules, as stated [previously](#tutorial_config_reference_general_contrib), these extra modules can be added to your final build by setting `DOPENCV_EXTRA_MODULES_PATH` option.
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `WITH_CLP` | _OFF_ | Will add [coinor](https://projects.coin-or.org/Clp) linear programming library build support which is required in `videostab` module. Make sure to install the development libraries of coinor-clp. |
+
 
 # Other non-documented options
 
@@ -578,10 +624,10 @@ Some features have been added specifically for automated build environments, lik
 `CMAKE_TOOLCHAIN_FILE`
 
 `WITH_CAROTENE`
+`WITH_KLEIDICV`
 `WITH_CPUFEATURES`
 `WITH_EIGEN`
 `WITH_OPENVX`
-`WITH_CLP`
 `WITH_DIRECTX`
 `WITH_VA`
 `WITH_LAPACK`

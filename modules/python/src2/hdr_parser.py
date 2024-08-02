@@ -53,13 +53,13 @@ class CppHeaderParser(object):
     def get_macro_arg(self, arg_str, npos):
         npos2 = npos3 = arg_str.find("(", npos)
         if npos2 < 0:
-            print("Error: no arguments for the macro at %d" % (self.lineno,))
+            print("Error: no arguments for the macro at %s:%d" % (self.hname, self.lineno))
             sys.exit(-1)
         balance = 1
         while 1:
             t, npos3 = self.find_next_token(arg_str, ['(', ')'], npos3+1)
             if npos3 < 0:
-                print("Error: no matching ')' in the macro call at %d" % (self.lineno,))
+                print("Error: no matching ')' in the macro call at %s:%d" % (self.hname, self.lineno))
                 sys.exit(-1)
             if t == '(':
                 balance += 1
@@ -82,6 +82,10 @@ class CppHeaderParser(object):
         modlist = []
 
         # pass 0: extracts the modifiers
+        if "CV_ND" in arg_str:
+            modlist.append("/ND")
+            arg_str = arg_str.replace("CV_ND", "")
+
         if "CV_OUT" in arg_str:
             modlist.append("/O")
             arg_str = arg_str.replace("CV_OUT", "")
@@ -89,6 +93,10 @@ class CppHeaderParser(object):
         if "CV_IN_OUT" in arg_str:
             modlist.append("/IO")
             arg_str = arg_str.replace("CV_IN_OUT", "")
+
+        if "CV_WRAP_FILE_PATH" in arg_str:
+            modlist.append("/PATH")
+            arg_str = arg_str.replace("CV_WRAP_FILE_PATH", "")
 
         isarray = False
         npos = arg_str.find("CV_CARRAY")
@@ -166,7 +174,7 @@ class CppHeaderParser(object):
                 angle_stack.append(0)
             elif w == "," or w == '>':
                 if not angle_stack:
-                    print("Error at %d: argument contains ',' or '>' not within template arguments" % (self.lineno,))
+                    print("Error at %s:%d: argument contains ',' or '>' not within template arguments" % (self.hname, self.lineno))
                     sys.exit(-1)
                 if w == ",":
                     arg_type += "_and_"
@@ -196,7 +204,7 @@ class CppHeaderParser(object):
             p1 = arg_name.find("[")
             p2 = arg_name.find("]",p1+1)
             if p2 < 0:
-                print("Error at %d: no closing ]" % (self.lineno,))
+                print("Error at %s:%d: no closing ]" % (self.hname, self.lineno))
                 sys.exit(-1)
             counter_str = arg_name[p1+1:p2].strip()
             if counter_str == "":
@@ -259,7 +267,13 @@ class CppHeaderParser(object):
         if "CV_EXPORTS_W_SIMPLE" in l:
             l = l.replace("CV_EXPORTS_W_SIMPLE", "")
             modlist.append("/Simple")
+        if "CV_EXPORTS_W_PARAMS" in l:
+            l = l.replace("CV_EXPORTS_W_PARAMS", "")
+            modlist.append("/Map")
+            modlist.append("/Params")
         npos = l.find("CV_EXPORTS_AS")
+        if npos < 0:
+            npos = l.find('CV_WRAP_AS')
         if npos >= 0:
             macro_arg, npos3 = self.get_macro_arg(l, npos)
             modlist.append("=" + macro_arg)
@@ -435,11 +449,17 @@ class CppHeaderParser(object):
         # filter off some common prefixes, which are meaningless for Python wrappers.
         # note that we do not strip "static" prefix, which does matter;
         # it means class methods, not instance methods
-        decl_str = self.batch_replace(decl_str, [("static inline", ""), ("inline", ""), ("explicit ", ""),
-                                                 ("CV_EXPORTS_W", ""), ("CV_EXPORTS", ""), ("CV_CDECL", ""),
-                                                 ("CV_WRAP ", " "), ("CV_INLINE", ""),
-                                                 ("CV_DEPRECATED", ""), ("CV_DEPRECATED_EXTERNAL", "")]).strip()
-
+        decl_str = self.batch_replace(decl_str, [("static inline", ""),
+                                                 ("inline", ""),
+                                                 ("explicit ", ""),
+                                                 ("CV_EXPORTS_W", ""),
+                                                 ("CV_EXPORTS", ""),
+                                                 ("CV_CDECL", ""),
+                                                 ("CV_WRAP ", " "),
+                                                 ("CV_INLINE", ""),
+                                                 ("CV_DEPRECATED", ""),
+                                                 ("CV_DEPRECATED_EXTERNAL", ""),
+                                                 ("CV_NODISCARD_STD", "")]).strip()
 
         if decl_str.strip().startswith('virtual'):
             virtual_method = True
@@ -497,9 +517,9 @@ class CppHeaderParser(object):
             if rettype == classname or rettype == "~" + classname:
                 rettype, funcname = "", rettype
             else:
-                if bool(re.match('\w+\s+\(\*\w+\)\s*\(.*\)', decl_str)):
+                if bool(re.match(r'\w+\s+\(\*\w+\)\s*\(.*\)', decl_str)):
                     return [] # function typedef
-                elif bool(re.match('\w+\s+\(\w+::\*\w+\)\s*\(.*\)', decl_str)):
+                elif bool(re.match(r'\w+\s+\(\w+::\*\w+\)\s*\(.*\)', decl_str)):
                     return [] # class method typedef
                 elif bool(re.match('[A-Z_]+', decl_start)):
                     return [] # it seems to be a macro instantiation
@@ -521,6 +541,13 @@ class CppHeaderParser(object):
             return []
 
         funcname = self.get_dotted_name(funcname)
+
+        # see https://github.com/opencv/opencv/issues/24057
+        is_arithm_op_func = funcname in {"cv.add",
+                                         "cv.subtract",
+                                         "cv.absdiff",
+                                         "cv.multiply",
+                                         "cv.divide"}
 
         if not self.wrap_mode:
             decl = self.parse_func_decl_no_wrap(decl_str, static_method, docstring)
@@ -582,6 +609,8 @@ class CppHeaderParser(object):
 
                         if arg_type == "InputArray":
                             arg_type = mat
+                            if is_arithm_op_func:
+                                modlist.append("/AOS") # Arithm Ope Source
                         elif arg_type == "InputOutputArray":
                             arg_type = mat
                             modlist.append("/IO")
@@ -603,6 +632,10 @@ class CppHeaderParser(object):
                                                              ("InputOutputArray", mat),
                                                              ("OutputArray", mat),
                                                              ("noArray", arg_type)]).strip()
+                    if '/IO' in modlist and '/O' in modlist:
+                        modlist.remove('/O')
+                    if (arg_name.lower() == 'filename' or arg_name.lower() == 'filepath') and '/PATH' not in modlist:
+                        modlist.append('/PATH')
                     args.append([arg_type, arg_name, defval, modlist])
                 npos = arg_start-1
 
@@ -767,7 +800,15 @@ class CppHeaderParser(object):
                 var_list = [var_name1] + [i.strip() for i in var_list[1:]]
 
                 for v in var_list:
-                    class_decl[3].append([var_type, v, "", var_modlist])
+                    prop_definition = v.split('=')
+                    prop_name = prop_definition[0].strip()
+                    if len(prop_definition) == 1:
+                        # default value is not provided
+                        prop_default_value = ''
+                    else:
+                        prop_default_value = prop_definition[-1]
+                    class_decl[3].append([var_type, prop_name, prop_default_value,
+                                          var_modlist])
             return stmt_type, "", False, None
 
         # something unknown
@@ -829,6 +870,8 @@ class CppHeaderParser(object):
                     ("GAPI_EXPORTS_W", "CV_EXPORTS_W"),
                     ("GAPI_EXPORTS_W_SIMPLE","CV_EXPORTS_W_SIMPLE"),
                     ("GAPI_WRAP", "CV_WRAP"),
+                    ("GAPI_PROP", "CV_PROP"),
+                    ("GAPI_PROP_RW", "CV_PROP_RW"),
                     ('defined(GAPI_STANDALONE)', '0'),
                 ])
 
@@ -841,7 +884,11 @@ class CppHeaderParser(object):
                     continue
                 state = SCAN
                 l = re.sub(r'//(.+)?', '', l).strip()  # drop // comment
-                if l == '#if 0' or l == '#if defined(__OPENCV_BUILD)' or l == '#ifdef __OPENCV_BUILD':
+                if l in [
+                    '#if 0',
+                    '#if defined(__OPENCV_BUILD)', '#ifdef __OPENCV_BUILD',
+                    '#if !defined(OPENCV_BINDING_PARSER)', '#ifndef OPENCV_BINDING_PARSER',
+                ]:
                     state = DIRECTIVE_IF_0
                     depth_if_0 = 1
                 continue
@@ -971,7 +1018,8 @@ class CppHeaderParser(object):
                                 has_mat = len(list(filter(lambda x: x[0] in {"Mat", "vector_Mat"}, args))) > 0
                                 if has_mat:
                                     _, _, _, gpumat_decl = self.parse_stmt(stmt, token, mat="cuda::GpuMat", docstring=docstring)
-                                    decls.append(gpumat_decl)
+                                    if gpumat_decl != decl:
+                                        decls.append(gpumat_decl)
 
                             if self._generate_umat_decls:
                                 # If function takes as one of arguments Mat or vector<Mat> - we want to create the
@@ -980,12 +1028,13 @@ class CppHeaderParser(object):
                                 has_mat = len(list(filter(lambda x: x[0] in {"Mat", "vector_Mat"}, args))) > 0
                                 if has_mat:
                                     _, _, _, umat_decl = self.parse_stmt(stmt, token, mat="UMat", docstring=docstring)
-                                    decls.append(umat_decl)
+                                    if umat_decl != decl:
+                                        decls.append(umat_decl)
 
                         docstring = ""
                     if stmt_type == "namespace":
                         chunks = [block[1] for block in self.block_stack if block[0] == 'namespace'] + [name]
-                        self.namespaces.add('.'.join(chunks))
+                        self.namespaces.add('.'.join(filter(lambda c: len(c)> 0, chunks)))
                 else:
                     stmt_type, name, parse_flag = "block", "", False
 

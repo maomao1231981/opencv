@@ -1625,36 +1625,30 @@ bool Chessboard::Board::normalizeMarkerOrientation()
             if(!current_cell->marker || !current_cell->right || !current_cell->right->marker)
                 continue;
 
-            if(current_cell->black)
+            if(current_cell->right->top && current_cell->right->top->marker)
             {
-                if(current_cell->right->top && current_cell->right->top->marker)
-                {
-                    rotateLeft();
-                    rotateLeft();
-                    pcell = current_cell->right;
-                    break;
-                }
-                if(current_cell->right->bottom && current_cell->right->bottom->marker)
-                {
-                    rotateLeft();
-                    pcell = current_cell->right;
-                    break;
-                }
+                rotateLeft();
+                rotateLeft();
+                pcell = current_cell->right;
+                break;
             }
-            else
+            if(current_cell->right->bottom && current_cell->right->bottom->marker)
             {
-                if(current_cell->top && current_cell->top->marker)
-                {
-                    rotateRight();
-                    pcell = current_cell;
-                    break;
-                }
-                if(current_cell->bottom && current_cell->bottom->marker)
-                {
-                    // correct orientation
-                    pcell = current_cell;
-                    break;
-                }
+                rotateLeft();
+                pcell = current_cell->right;
+                break;
+            }
+            if(current_cell->top && current_cell->top->marker)
+            {
+                rotateRight();
+                pcell = current_cell;
+                break;
+            }
+            if(current_cell->bottom && current_cell->bottom->marker)
+            {
+                // correct orientation
+                pcell = current_cell;
+                break;
             }
         }
     }
@@ -1663,7 +1657,7 @@ bool Chessboard::Board::normalizeMarkerOrientation()
         //check for ambiguity
         if(rowCount()-pcell->bottom->getRow() > 2)
         {
-           // std::cout << "FIX board " << pcell->bottom->getRow() << " " << rowCount();
+            CV_LOG_DEBUG(NULL, "FIX board " << pcell->bottom->getRow() << " " << rowCount());
             flipVertical();
             rotateRight();
         }
@@ -1707,10 +1701,10 @@ void Chessboard::Board::normalizeOrientation(bool bblack)
                 iter_bottom_left.getCell()->empty() || iter_bottom_right.getCell()->empty())
             return;
 
-        float d1 = pow(top_left->top_left->x,2)+pow(top_left->top_left->y,2);
-        float d2 = pow((*iter_top_right)->x,2)+pow((*iter_top_right)->y,2);
-        float d3 = pow((*iter_bottom_left)->x,2)+pow((*iter_bottom_left)->y,2);
-        float d4 = pow((*iter_bottom_right)->x,2)+pow((*iter_bottom_right)->y,2);
+        float d1 = top_left->top_left->dot(*top_left->top_left);
+        float d2 = (*iter_top_right)->dot(*(*iter_top_right));
+        float d3 = (*iter_bottom_left)->dot(*(*iter_bottom_left));
+        float d4 = (*iter_bottom_right)->dot(*(*iter_bottom_right));
         if(d2 <= d1 && d2 <= d3 && d2 <= d4) // top left is top right
             rotateLeft();
         else if(d3 <= d1 && d3 <= d2 && d3 <= d4) // top left is bottom left
@@ -2265,7 +2259,7 @@ int Chessboard::Board::detectMarkers(cv::InputArray image)
                 cell->marker = noise-signal > (noise-reference)*0.5;
             if(cell->marker)
                 count++;
-            // std::cout << x << "/" << y << " signal " << signal << " noise " << noise << " reference " << reference  << " has marker " << int(cell->marker) << std::endl;
+            CV_LOG_DEBUG(NULL, "Cell: " << x << "/" << y << " signal " << signal << " noise " << noise << " reference " << reference  << " has marker " << int(cell->marker));
         }
     }
     return count;
@@ -3379,7 +3373,7 @@ cv::Scalar Chessboard::Board::calcEdgeSharpness(cv::InputArray _img,float rise_d
     }
     if(count == 0)
     {
-        std::cout  <<"calcEdgeSharpness: checkerboard too small for calculation." << std::endl;
+        CV_LOG_DEBUG(NULL, "calcEdgeSharpness: checkerboard too small for calculation.");
         return cv::Scalar::all(9999);
     }
     sharpness = sharpness/float(count);
@@ -3924,7 +3918,7 @@ bool findChessboardCornersSB(cv::InputArray image_, cv::Size pattern_size,
     {
         meta_.create(int(board.rowCount()),int(board.colCount()),CV_8UC1);
         cv::Mat meta = meta_.getMat();
-        meta = 0;
+        meta.setTo(cv::Scalar::all(0));
         for(int row =0;row < meta.rows-1;++row)
         {
             for(int col=0;col< meta.cols-1;++col)
